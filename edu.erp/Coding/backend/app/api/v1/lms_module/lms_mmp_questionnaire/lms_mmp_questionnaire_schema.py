@@ -31,3 +31,33 @@ class QuestionnaireSave(BaseModel):
     parent_id: Optional[int] = None
 
     questions: List[QuestionCreate]
+
+class OptionResponse(BaseModel):
+    questionnaire_options_id: int
+    que_option: str
+    specify_flag: bool = False
+
+
+class QuestionResponse(BaseModel):
+    questionnaire_que_id: int
+    que_type_id: int
+    que_no: int
+    question: str
+    questionnaire_type_id: int
+    que_is_mandatory: bool
+    options: List[OptionResponse] = []
+
+
+class QuestionnaireListResponse(BaseModel):
+    questionnaire_id: int
+    questionnaire_name: str
+    message_to_mentees: Optional[str] = None
+    access_level: int
+    parent_id: Optional[int] = None
+    questions: List[QuestionResponse] = []
+
+
+class QuestionnaireListDataResponse(BaseModel):
+    status: bool
+    message: str
+    data: List[QuestionnaireListResponse]

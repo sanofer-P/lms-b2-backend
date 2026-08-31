@@ -18,7 +18,8 @@ from app.db.models import (
 )
 
 from .lms_mmp_questionnaire_schema import (
-    QuestionnaireSave
+    QuestionnaireSave,
+    QuestionnaireListDataResponse
 )
 
 router = APIRouter()
@@ -34,35 +35,31 @@ def save_questionnaire(
 
     try:
 
-        # -----------------------------
-        # ADD QUESTIONNAIRE
-        # -----------------------------
+        # =====================================================
+        # ADD / EDIT QUESTIONNAIRE
+        # =====================================================
 
         if questionnaire_data.questionnaire_id is None:
 
             questionnaire = LMSQuestionnaires(
-                questionnaire_name=
-                questionnaire_data.questionnaire_name.strip(),
-
-                message_to_mentees=
-                questionnaire_data.message_to_mentees,
-
-                access_level=
-                questionnaire_data.access_level,
-
-                parent_id=
-                questionnaire_data.parent_id,
-
+                questionnaire_name=(
+                    questionnaire_data.questionnaire_name.strip()
+                ),
+                message_to_mentees=(
+                    questionnaire_data.message_to_mentees
+                ),
+                access_level=(
+                    questionnaire_data.access_level
+                ),
+                parent_id=(
+                    questionnaire_data.parent_id
+                ),
                 created_by=user_id,
                 created_date=datetime.now()
             )
 
             db.add(questionnaire)
             db.flush()
-
-        # -----------------------------
-        # EDIT QUESTIONNAIRE
-        # -----------------------------
 
         else:
 
@@ -98,35 +95,44 @@ def save_questionnaire(
             questionnaire.modified_by = user_id
             questionnaire.modified_date = datetime.now()
 
-        # -----------------------------
+
+        # =====================================================
         # QUESTIONS
-        # -----------------------------
+        # =====================================================
 
         for question_item in questionnaire_data.questions:
 
+            # -------------------------------------------------
             # ADD QUESTION
+            # -------------------------------------------------
 
             if question_item.questionnaire_que_id is None:
 
                 question = LMSQuestionnairesQuestions(
 
-                    questionnaire_id=
-                    questionnaire.questionnaire_id,
+                    questionnaire_id=(
+                        questionnaire.questionnaire_id
+                    ),
 
-                    que_type_id=
-                    question_item.que_type_id,
+                    que_type_id=(
+                        question_item.que_type_id
+                    ),
 
-                    que_no=
-                    question_item.que_no,
+                    que_no=(
+                        question_item.que_no
+                    ),
 
-                    question=
-                    question_item.question,
+                    question=(
+                        question_item.question.strip()
+                    ),
 
-                    questionnaire_type_id=
-                    question_item.questionnaire_type_id,
+                    questionnaire_type_id=(
+                        question_item.questionnaire_type_id
+                    ),
 
-                    que_is_mandatory=
-                    question_item.que_is_mandatory,
+                    que_is_mandatory=(
+                        question_item.que_is_mandatory
+                    ),
 
                     created_by=user_id,
                     created_date=datetime.now()
@@ -135,7 +141,10 @@ def save_questionnaire(
                 db.add(question)
                 db.flush()
 
+
+            # -------------------------------------------------
             # EDIT QUESTION
+            # -------------------------------------------------
 
             else:
 
@@ -143,10 +152,14 @@ def save_questionnaire(
                     LMSQuestionnairesQuestions
                 ).filter(
                     LMSQuestionnairesQuestions.questionnaire_que_id ==
-                    question_item.questionnaire_que_id
+                    question_item.questionnaire_que_id,
+
+                    LMSQuestionnairesQuestions.questionnaire_id ==
+                    questionnaire.questionnaire_id
                 ).first()
 
                 if not question:
+
                     continue
 
                 question.que_type_id = (
@@ -158,7 +171,7 @@ def save_questionnaire(
                 )
 
                 question.question = (
-                    question_item.question
+                    question_item.question.strip()
                 )
 
                 question.questionnaire_type_id = (
@@ -172,26 +185,35 @@ def save_questionnaire(
                 question.modified_by = user_id
                 question.modified_date = datetime.now()
 
-            # -----------------------------
+
+            # =================================================
             # OPTIONS
-            # -----------------------------
+            # =================================================
+
+            # Get option IDs currently sent from React
+            incoming_option_ids = set()
 
             for option_item in question_item.options:
 
+                # -------------------------------------------------
                 # ADD OPTION
+                # -------------------------------------------------
 
                 if option_item.questionnaire_options_id is None:
 
                     option = LMSQuestionnairesOptions(
 
-                        questionnaire_que_id=
-                        question.questionnaire_que_id,
+                        questionnaire_que_id=(
+                            question.questionnaire_que_id
+                        ),
 
-                        que_option=
-                        option_item.que_option.strip(),
+                        que_option=(
+                            option_item.que_option.strip()
+                        ),
 
-                        specify_flag=
-                        option_item.specify_flag,
+                        specify_flag=(
+                            option_item.specify_flag
+                        ),
 
                         created_by=user_id,
                         created_date=datetime.now()
@@ -199,7 +221,10 @@ def save_questionnaire(
 
                     db.add(option)
 
+
+                # -------------------------------------------------
                 # EDIT OPTION
+                # -------------------------------------------------
 
                 else:
 
@@ -207,11 +232,19 @@ def save_questionnaire(
                         LMSQuestionnairesOptions
                     ).filter(
                         LMSQuestionnairesOptions.questionnaire_options_id ==
-                        option_item.questionnaire_options_id
+                        option_item.questionnaire_options_id,
+
+                        LMSQuestionnairesOptions.questionnaire_que_id ==
+                        question.questionnaire_que_id
                     ).first()
 
                     if not option:
+
                         continue
+
+                    incoming_option_ids.add(
+                        option_item.questionnaire_options_id
+                    )
 
                     option.que_option = (
                         option_item.que_option.strip()
@@ -224,15 +257,72 @@ def save_questionnaire(
                     option.modified_by = user_id
                     option.modified_date = datetime.now()
 
+
+            # -------------------------------------------------
+            # DELETE REMOVED OPTIONS
+            # -------------------------------------------------
+
+            existing_options = db.query(
+                LMSQuestionnairesOptions
+            ).filter(
+                LMSQuestionnairesOptions.questionnaire_que_id ==
+                question.questionnaire_que_id
+            ).all()
+
+            for existing_option in existing_options:
+
+                if (
+                    existing_option.questionnaire_options_id
+                    not in incoming_option_ids
+                    and existing_option.questionnaire_options_id
+                    not in [
+                        option.questionnaire_options_id
+                        for option in question_item.options
+                        if option.questionnaire_options_id is None
+                    ]
+                ):
+
+                    db.delete(existing_option)
+
+
+        # =====================================================
+        # COMMIT
+        # =====================================================
+
+        # =====================================================
+        # COMMIT
+        # =====================================================
+
+        print("QUESTIONNAIRE ID BEFORE COMMIT:",
+            questionnaire.questionnaire_id)
+
+        print("QUESTIONNAIRE NAME:",
+            questionnaire.questionnaire_name)
+
+        print("NUMBER OF QUESTIONS:",
+            len(questionnaire_data.questions))
+
         db.commit()
 
-        return returnSuccess({
-            "questionnaire_id":
-            questionnaire.questionnaire_id,
+        print("COMMIT SUCCESS")
 
-            "questionnaire_name":
-            questionnaire.questionnaire_name
+        return returnSuccess({
+            "questionnaire_id": questionnaire.questionnaire_id,
+            "questionnaire_name": questionnaire.questionnaire_name
         })
+
+        db.commit()
+
+        # return returnSuccess({
+
+        #     "questionnaire_id":
+        #         questionnaire.questionnaire_id,
+
+        #     "questionnaire_name":
+        #         questionnaire.questionnaire_name
+
+        # }
+
 
     except Exception as e:
 
@@ -240,38 +330,157 @@ def save_questionnaire(
 
         return returnException(str(e))
     
-@router.get("/get_questionnaire_list")
-def get_questionnaire_list(
+@router.get(
+    "/questionnaire_list",
+    response_model=QuestionnaireListDataResponse
+)
+def questionnaire_list(
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    data = db.query(
-        LMSQuestionnaires
-    ).order_by(
-        LMSQuestionnaires.questionnaire_id.desc()
-    ).all()
+    try:
 
-    result = []
+        # =====================================================
+        # GET QUESTIONNAIRES
+        # =====================================================
 
-    for row in data:
+        questionnaires = (
+            db.query(LMSQuestionnaires)
+            .order_by(
+                LMSQuestionnaires.questionnaire_id.desc()
+            )
+            .all()
+        )
 
-        result.append({
-            "questionnaire_id":
-            row.questionnaire_id,
+        result = []
 
-            "questionnaire_name":
-            row.questionnaire_name,
+        # =====================================================
+        # LOOP QUESTIONNAIRES
+        # =====================================================
 
-            "message_to_mentees":
-            row.message_to_mentees,
+        for questionnaire in questionnaires:
 
-            "access_level":
-            row.access_level,
+            questions = (
+                db.query(
+                    LMSQuestionnairesQuestions
+                )
+                .filter(
+                    LMSQuestionnairesQuestions.questionnaire_id
+                    == questionnaire.questionnaire_id
+                )
+                .order_by(
+                    LMSQuestionnairesQuestions.que_no.asc()
+                )
+                .all()
+            )
 
-            "parent_id":
-            row.parent_id
-        })
+            question_list = []
 
-    return returnSuccess(result)
+            # =================================================
+            # LOOP QUESTIONS
+            # =================================================
+
+            for question in questions:
+
+                options = (
+                    db.query(
+                        LMSQuestionnairesOptions
+                    )
+                    .filter(
+                        LMSQuestionnairesOptions.questionnaire_que_id
+                        == question.questionnaire_que_id
+                    )
+                    .order_by(
+                        LMSQuestionnairesOptions.questionnaire_options_id.asc()
+                    )
+                    .all()
+                )
+
+                option_list = []
+
+                for option in options:
+
+                    option_list.append(
+                        {
+                            "questionnaire_options_id":
+                                option.questionnaire_options_id,
+
+                            "que_option":
+                                option.que_option,
+
+                            "specify_flag":
+                                bool(option.specify_flag)
+                        }
+                    )
+
+                question_list.append(
+                    {
+                        "questionnaire_que_id":
+                            question.questionnaire_que_id,
+
+                        "que_type_id":
+                            question.que_type_id,
+
+                        "que_no":
+                            question.que_no,
+
+                        "question":
+                            question.question,
+
+                        "questionnaire_type_id":
+                            question.questionnaire_type_id,
+
+                        "que_is_mandatory":
+                            bool(question.que_is_mandatory),
+
+                        "options":
+                            option_list
+                    }
+                )
+
+            # =================================================
+            # QUESTIONNAIRE
+            # =================================================
+
+            result.append(
+                {
+                    "questionnaire_id":
+                        questionnaire.questionnaire_id,
+
+                    "questionnaire_name":
+                        questionnaire.questionnaire_name,
+
+                    "message_to_mentees":
+                        questionnaire.message_to_mentees,
+
+                    "access_level":
+                        questionnaire.access_level,
+
+                    "parent_id":
+                        questionnaire.parent_id,
+
+                    "questions":
+                        question_list
+                }
+            )
+
+        # =====================================================
+        # RETURN
+        # =====================================================
+
+        return {
+            "status": True,
+            "message": "Completed",
+            "data": result
+        }
+
+    except Exception as e:
+
+        return {
+            "status": False,
+            "message": str(e),
+            "data": []
+        }
 
 @router.get(
     "/get_questionnaire_full/{questionnaire_id}"
@@ -379,25 +588,46 @@ def delete_question(
     questionnaire_que_id: int,
     db: Session = Depends(get_db)
 ):
-    question = db.query(
-        LMSQuestionnairesQuestions
-    ).filter(
-        LMSQuestionnairesQuestions.questionnaire_que_id
-        == questionnaire_que_id
-    ).first()
 
-    if not question:
-        return returnException(
-            "Question not found"
+    try:
+
+        question = db.query(
+            LMSQuestionnairesQuestions
+        ).filter(
+            LMSQuestionnairesQuestions.questionnaire_que_id
+            == questionnaire_que_id
+        ).first()
+
+        if not question:
+
+            return returnException(
+                "Question not found"
+            )
+
+        # Delete options first
+        db.query(
+            LMSQuestionnairesOptions
+        ).filter(
+            LMSQuestionnairesOptions.questionnaire_que_id
+            == questionnaire_que_id
+        ).delete(
+            synchronize_session=False
         )
 
-    db.delete(question)
+        # Delete question
+        db.delete(question)
 
-    db.commit()
+        db.commit()
 
-    return returnSuccess(
-        "Question deleted successfully"
-    )
+        return returnSuccess(
+            "Question deleted successfully"
+        )
+
+    except Exception as e:
+
+        db.rollback()
+
+        return returnException(str(e))
 
 @router.delete("/delete_option/{questionnaire_options_id}")
 def delete_option(
