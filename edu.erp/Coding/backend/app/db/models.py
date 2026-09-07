@@ -2595,6 +2595,9 @@ class IEMSemester(Base):
     enroll_start_time = Column(Time, nullable=False)
     enroll_end_date = Column(Date, nullable=True)    
     enroll_end_time = Column(Time, nullable=False)
+    total_crs_enroll = Column(Float, nullable=True)
+    own_crclm_elective = Column(Integer, nullable=False)
+    other_crclm_elective = Column(Integer, nullable=False)
     # enroll_start_date = Column(DateTime, nullable=True)
     # enroll_start_time = Column(String(50), nullable=False, default='00:00:00')   
     # enroll_end_date = Column(Date, nullable=False)
@@ -7447,3 +7450,112 @@ class StudentNotificationMap(Base):
     notify_seenon_datetime = Column(DateTime)
     created_by = Column(Integer)
     created_at = Column(DateTime)
+
+class LMSTimetableDetails(Base):
+    __tablename__ = "lms_tt_time_table_details"
+    
+    tt_detail_id = Column(Integer, primary_key=True, autoincrement=True)
+    academic_batch_id = Column(Integer, nullable=False)
+    semester_id = Column(Integer, nullable=False)
+    section_id = Column(Integer, nullable=False)
+    tt_start_date = Column(String(50), nullable=False)
+    tt_end_date = Column(String(50), nullable=False)
+    tt_start_time = Column(String(50), nullable=False)
+    tt_end_time = Column(String(50), nullable=False)
+    tt_time_slot_gap = Column(String(50), nullable=False)
+    lms_reg_byp_flag = Column(SmallInteger, default=0) 
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(DateTime, server_default=func.now())
+    modified_date = Column(DateTime, onupdate=func.now())
+    
+    # Relationships
+    time_tables = relationship("LMSTimetable", back_populates="details")
+
+
+class LMSTimetable(Base):
+    __tablename__ = "lms_tt_time_table"
+    
+    time_table_id = Column(Integer, primary_key=True, autoincrement=True)
+    tt_detail_id = Column(Integer, ForeignKey("lms_tt_time_table_details.tt_detail_id"), nullable=False)
+    day_id = Column(Integer, nullable=False)
+    week_day_name = Column(String(50), nullable=True)  # Changed to nullable
+    crs_id = Column(Integer, nullable=False)
+    crs_code = Column(String(45), nullable=False)
+    class_start_time = Column(String(45), nullable=False)
+    class_end_time = Column(String(45), nullable=False)
+    extra_class_flag = Column(Integer, default=0)
+    extra_class_created = Column(Integer, nullable=True)
+    bg_color = Column(String(45), nullable=True)
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(DateTime, server_default=func.now())
+    modified_date = Column(DateTime, onupdate=func.now())
+    
+    details = relationship("LMSTimetableDetails", back_populates="time_tables")
+    day_mappings = relationship("LMSTimetableDayMapping", back_populates="time_table")
+
+
+class LMSTimetableDayMapping(Base):
+    __tablename__ = "lms_tt_time_table_day_mapping"
+    
+    tt_day_map_id = Column(Integer, primary_key=True, autoincrement=True)
+    time_table_id = Column(Integer, ForeignKey("lms_tt_time_table.time_table_id"), nullable=False)
+    tt_detail_id = Column(Integer, ForeignKey("lms_tt_time_table_details.tt_detail_id"), nullable=False)
+    day_id = Column(Integer, nullable=False)
+    week_day_name = Column(String(50), nullable=True)
+    class_date = Column(String(45), nullable=False)
+    allot_crs_id = Column(Integer, nullable=True)
+    allot_by = Column(Integer, nullable=True)
+    extra_class_flag = Column(Integer, default=0)
+    extra_class_created = Column(Integer, nullable=True)
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(DateTime, server_default=func.now())
+    modified_date = Column(DateTime, onupdate=func.now())
+    
+    time_table = relationship("LMSTimetable", back_populates="day_mappings")
+
+
+class LMSTimetableBatchMap(Base):
+    __tablename__ = "lms_tt_time_table_batch_map"
+    
+    tt_batch_map_id = Column(Integer, primary_key=True, autoincrement=True)
+    time_table_id = Column(Integer, ForeignKey("lms_tt_time_table.time_table_id"), nullable=False)
+    tt_detail_id = Column(Integer, ForeignKey("lms_tt_time_table_details.tt_detail_id"), nullable=False)
+    batch_id = Column(Integer, nullable=False)
+    crs_id = Column(Integer, nullable=False)
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(DateTime, server_default=func.now())
+    modified_date = Column(DateTime, onupdate=func.now())
+
+
+class LMSWeekDay(Base):
+    __tablename__ = "lms_tt_weekdays"
+    
+    day_id = Column(Integer, primary_key=True)
+    week_day_name = Column(String(50), nullable=True)
+    short_name = Column(String(10), nullable=True)
+    days_order = Column(Integer, nullable=True)
+    is_active = Column(Integer, default=1)
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(DateTime, server_default=func.now())
+    modified_date = Column(DateTime, onupdate=func.now())
+
+class CudosCourseCloOwner(Base):
+    __tablename__ = "cudos_course_clo_owner"
+
+    oid = Column(Integer, primary_key=True, autoincrement=True)
+    academic_batch_id = Column(Integer, nullable=False, index=True)
+    semester_id = Column(Integer, nullable=False, index=True)
+    crs_id = Column(Integer, nullable=False, index=True)
+    clo_owner_id = Column(Integer, nullable=True, index=True)
+    dept_id = Column(Integer, nullable=False, index=True)
+    last_date = Column(Date, nullable=True)
+    created_by = Column(Integer, nullable=True)
+    modified_by = Column(Integer, nullable=True)
+    created_date = Column(Date, nullable=True)
+    modified_date = Column(Date, nullable=True)
+    mte_finalize_flag = Column(TINYINT, nullable=True)

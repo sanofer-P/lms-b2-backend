@@ -1,9 +1,12 @@
-from pydantic import BaseModel
-#classes
-class AssignmentListRequest(BaseModel):
-    course_id: int
-    semester_id: int
-    academic_batch_id: int
+from pydantic import BaseModel, PositiveInt
 
-class StudentAssignmentReportRequest(BaseModel):
-    assignment_id: int
+
+class AssignmentListRequest(BaseModel):
+    course_id: PositiveInt
+    semester_id: PositiveInt
+    academic_batch_id: PositiveInt
+    section_id: PositiveInt
+
+
+class StudentAssignmentReportRequest(AssignmentListRequest):
+    assignment_id: PositiveInt

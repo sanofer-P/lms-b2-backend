@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_,Time
+from datetime import datetime
 
 from app.core.database import get_db
 from app.utils.http_return_helper import returnSuccess
@@ -50,16 +51,6 @@ def get_academic_batch_list(
 
     return returnSuccess(result)
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-
-from app.core.database import get_db
-from app.utils.http_return_helper import returnSuccess
-from app.db.models import IEMSemester
-
-router = APIRouter()
-
-
 @router.get("/get_semester_list")
 def get_semester_list(
     academic_batch_id: int,
@@ -87,18 +78,6 @@ def get_semester_list(
     ]
 
     return returnSuccess(result)
-
-from datetime import datetime
-
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-
-from app.core.database import get_db
-from app.utils.http_return_helper import returnSuccess
-from app.db.models import IEMSemester
-
-router = APIRouter()
-
 
 @router.get("/check_registration_status")
 def check_registration_status(

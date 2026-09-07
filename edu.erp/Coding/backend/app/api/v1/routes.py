@@ -89,6 +89,9 @@ from app.api.v1.lms_module.student_details import router as student_details_rout
 from app.api.v1.lms_module.lms_student_course_registration.lms_student_course_registration import (
     router as lms_student_course_registration_router
 )
+from app.api.v1.lms_module.registration_setup.registrationSetup import (
+    router as registration_setup_router
+)
 
 ##All LMS Modules
 from app.api.v1.lms_module.material.material_routes import router as material_router
@@ -102,18 +105,22 @@ from app.api.v1.lms_module.manage_assignment import router as manage_assignment_
 from app.api.v1.lms_module.manage_quiz import router as manage_quiz_router
 from app.api.v1.lms_module.export_timetable import router as export_timetable_router
 from app.api.v1.lms_module.schedule_class import router as schedule_class_router
+from app.api.v1.lms_module.tt_calendar.lesson_schedule import router as tt_calendar_router
 from app.api.v1.lms_module.student_record_report import router as student_record_report_router
 from app.api.v1.lms_module.attendance_status_report import router as attendance_status_report_router
 
-# from ...access_control.api.curriculum import router as curriculum_router
-# from ...access_control.api.timetable import router as timetable_router
-# from ...access_control.api.attendance import router as attendance_router
-# from ...access_control.api.student import router as student_router
-# from ...access_control.api.scheduled_classes import router as scheduled_classes_router
+# from app.access_control.api.curriculum import router as curriculum_router
+# from app.access_control.api.timetable import router as timetable_router
+# # from ...access_control.api.attendance import router as attendance_router
+# # from ...access_control.api.student import router as student_router
+# from app.access_control.api.scheduled_classes import router as scheduled_classes_router
+
+# Import all module routers
+from app.api.v1.lms_module.timetable.timetable import router as timetable_router
 
 # These were referenced in one version of the file.
 # Kept using the same module-naming convention as the other feature routers.
-from app.api.v1.lms_module.topic_coverage.topic_coverage_router import router as topic_coverage_router
+from app.api.v1.lms_module.topic_coverage.topic_coverage import router as topic_coverage_router
 from app.api.v1.lms_module.my_class.my_class_router import router as my_class_router
 
 router = APIRouter()
@@ -145,6 +152,8 @@ router.include_router(config_type_router, prefix="/config-type", tags=["LMS-Conf
 router.include_router(cross_department_mentor_router, prefix="/cross-dept-mentor", tags=["LMS-Cross Department Mentor"])
 router.include_router(mentor_list_router, prefix="/mentoring", tags=["LMS-Mentor List"])
 router.include_router(mentoring_router, prefix="/mentoring", tags=["LMS-Mentoring"])
+
+router.include_router(timetable_router, prefix="/timetable", tags=["LMS-Timetable"])
 
 # router.include_router(program.router, prefix="/program", tags=["EMS-configuration"])
 # router.include_router(
@@ -632,6 +641,7 @@ router.include_router(
 )
 
 router.include_router(lms_student_course_registration_router, prefix="/lms_student_course_registration",  tags=["Course Registration"])
+router.include_router(registration_setup_router, prefix="/registration_setup", tags=["Registration Setup"])
 
 router.include_router(material_router, prefix="/material", tags=["Material"])
 
@@ -642,6 +652,7 @@ router.include_router(manage_assignment_router, prefix="/manage-assignment", tag
 router.include_router(manage_quiz_router, prefix="/manage-quiz", tags=["Manage Quiz"])
 router.include_router(export_timetable_router, prefix="/export-timetable", tags=["Export Timetable"])
 router.include_router(schedule_class_router, prefix="/schedule-class", tags=["Schedule Class"])
+router.include_router(tt_calendar_router, prefix="/tt-calendar", tags=["Timetable Calendar"])
 
 # Reports
 router.include_router(student_record_report_router, prefix="/reports", tags=["Reports"])
@@ -659,3 +670,6 @@ router.include_router(my_class_router, prefix="/my-class", tags=["My Class"])
 # router.include_router(attendance_router)
 # router.include_router(student_router)
 # router.include_router(scheduled_classes_router)
+
+from app.api.v1.lms_module.quiz_report import router as quiz_report_router
+router.include_router(quiz_report_router, prefix="/quiz-report", tags=["Student Quiz Report"])

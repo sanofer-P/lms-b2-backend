@@ -1,1316 +1,447 @@
-from urllib import request
-print("🔥 Topic Router Loaded")
+"""Manage topic instructors using the current CUDOS/IEMS models.
 
-import logging
-from fastapi import APIRouter, Depends, HTTPException, Body
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import distinct, text
+LMS portions, including their dates, are section-specific. A schedule_id in
+this API is lms_map_portion_ls.mtp_id, not a global CUDOS schedule ID.
+"""
 from datetime import date, datetime
-from typing import Optional
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from .topic_calendar import sync_calendar, delivery_slots
 from app.core.database import get_db
-# Strictly using ONLY the allowed tables from your models.py
+from app.utils.auth_helper import get_current_user
 from app.db.models import (
-    IEMSCourses,
-    IEMSection,
-    CudosTopic,
-    IEMSAcademicBatch,
-    IEMSemester,
-    LMSMapInstructorTopic,
-    TopicLessonSchedule,
-    LMSMapPortionLS,
-    IEMSUsers,
-    LMSLessonSchedule,  # Added for section filtering
-    CudosMapCoursetoCourseInstructor,  # Added back for the Instructor/Handled By column
-    MasterTypeDetails,
-    MasterType
+    CudosTopic, CudosTopicLessonSchedule, IEMSAcademicBatch, IEMSemester,
+    IEMSCourses, MasterTypeDetails, CudosMapCoursetoCourseInstructor,
+    IEMSUsers, LMSMapInstructorTopic, LMSMapPortionLS,
 )
-# Using only your pre-existing schemas
 from .topic_schema import (
-    CourseListRequest,
-    TopicCreateRequest,
-    TopicListRequest,
-    UpdateInstructorRequest,
-    ImportCudosTopicsRequest,
-    ImportTopicRequest,
-    AddScheduleRequest
+    TopicContext, TopicListRequest, TopicCreateRequest, NewTopicRequest,
+    ImportTopicRequest, AssignTopicsRequest, TopicAssignment,
+    UpdateInstructorRequest, ScheduleInput, AddScheduleRequest,
+    SaveSchedulesRequest, ExtraClassRequest, BulkDeleteRequest,
 )
 
-
-router = APIRouter(
-    tags=["Topic Management"]
-)
-
-# Helper function to return success response
-def success_response(data, message="Success"):
-    return {
-        "success": True,
-        "message": message,
-        "data": data
-    }
-
-# Helper function to return error response
-def error_response(message, data=None):
-    return {
-        "success": False,
-        "message": message,
-        "data": data
-    }
-
-# =========================================================
-# ✅ DROPDOWN APIs
-# =========================================================
-
-@router.post("/curriculum_list")
-def get_curriculum_list_post(db: Session = Depends(get_db)):
-    try:
-        data = db.query(IEMSAcademicBatch).all()
-        result = [
-            {
-                "value": row.academic_batch_id,
-                "label": f"{row.academic_batch_desc} ({row.academic_year})",
-            }
-            for row in data
-        ]
-        return success_response(result)
-    except Exception as e:
-        print(f"ERROR in curriculum_list: {e}")
-        return error_response(str(e))
-
-
-@router.post("/semester_list")
-def get_semester_list_post(
-    request: dict = Body(...),  # Changed from empty Body() to accept request body
-    db: Session = Depends(get_db)
-):
-    """Get semesters - filter by academic_batch_id if provided"""
-    try:
-        query = db.query(IEMSemester)
-        
-        # Filter by academic_batch_id if provided in request body
-        academic_batch_id = request.get('academic_batch_id')
-        if academic_batch_id:
-            query = query.filter(IEMSemester.academic_batch_id == academic_batch_id)
-        
-        data = query.all()
-        result = [
-            {
-                "value": row.semester_id,
-                "label": f"Semester {row.semester}" if row.semester else row.semester_desc,
-            }
-            for row in data
-        ]
-        return success_response(result)
-    except Exception as e:
-        print(f"ERROR in semester_list: {e}")
-        return error_response(str(e))
-
-
-# @router.post("/course_list")
-# def get_course_list(request: CourseListRequest, db: Session = Depends(get_db)):
-#     """Get all courses - returns courses for selected curriculum"""
-#     try:
-#         query = db.query(IEMSCourses)
-        
-#         # Filter by curriculum only
-#         if request.curriculum_id:
-#             query = query.filter(IEMSCourses.academic_batch_id == request.curriculum_id)
-        
-#         courses = query.all()
-        
-#         if not courses:
-#             return success_response([])
-            
-#         result = [
-#             {
-#                 "value": row.crs_id,
-#                 "label": row.crs_title or f"Course {row.crs_id}",
-#                 "crs_id": row.crs_id,
-#                 "crs_code": row.crs_code,
-#                 "crs_title": row.crs_title,
-#                 "semester": row.semester,
-#             }
-#             for row in courses
-#         ]
-#         return success_response(result)
-#     except Exception as e:
-#         print(f"ERROR in course_list: {e}")
-#         return error_response(str(e))
-
-@router.post("/course_list")
-def get_course_list(
-    request: dict = Body(...),  # Changed from CourseListRequest to dict for flexibility
-    db: Session = Depends(get_db)
-):
-    """Get courses - filter by academic_batch_id and semester_id"""
-    try:
-        query = db.query(IEMSCourses)
-        
-        # Get filters from request body
-        academic_batch_id = request.get('academic_batch_id') or request.get('curriculum_id')
-        semester_id = request.get('semester_id')
-        
-        # Apply filters
-        if academic_batch_id:
-            query = query.filter(IEMSCourses.academic_batch_id == academic_batch_id)
-        
-        if semester_id:
-            query = query.filter(IEMSCourses.semester == semester_id)
-        
-        # If no filters provided, return all courses (or empty based on requirement)
-        courses = query.all()
-        
-        if not courses:
-            return success_response([])
-            
-        result = [
-            {
-                "value": row.crs_id,
-                "label": row.crs_title or f"Course {row.crs_id}",
-                "crs_id": row.crs_id,
-                "crs_code": row.crs_code,
-                "crs_title": row.crs_title,
-                "semester": row.semester,
-                "academic_batch_id": row.academic_batch_id,
-            }
-            for row in courses
-        ]
-        return success_response(result)
-    except Exception as e:
-        print(f"ERROR in course_list: {e}")
-        return error_response(str(e))
-
-@router.post("/section_list")
-def get_section_list(
-    course_id: Optional[int] = Body(None),
-    semester_id: Optional[int] = Body(None),
-    academic_batch_id: Optional[int] = Body(None),
-    db: Session = Depends(get_db),
-):
-    try:
-        print("\n========== SECTION LIST API ==========")
-        print("course_id:", course_id)
-        print("semester_id:", semester_id)
-        print("academic_batch_id:", academic_batch_id)
-
-        # Validate required parameters
-        if course_id is None:
-            return {
-                "success": False,
-                "message": "course_id is required",
-                "data": []
-            }
-
-        if semester_id is None:
-            return {
-                "success": False,
-                "message": "semester_id is required",
-                "data": []
-            }
-
-        if academic_batch_id is None:
-            return {
-                "success": False,
-                "message": "academic_batch_id is required",
-                "data": []
-            }
-
-        # Fetch sections
-        sections = (
-            db.query(
-                CudosMapCoursetoCourseInstructor.section_id,
-                MasterTypeDetails.mt_details_name,
-            )
-            .join(
-                MasterTypeDetails,
-                MasterTypeDetails.mt_details_id
-                == CudosMapCoursetoCourseInstructor.section_id,
-            )
-            .filter(
-                CudosMapCoursetoCourseInstructor.academic_batch_id
-                == academic_batch_id
-            )
-            .filter(
-                CudosMapCoursetoCourseInstructor.semester_id
-                == semester_id
-            )
-            .filter(
-                CudosMapCoursetoCourseInstructor.crs_id
-                == course_id
-            )
-            .filter(
-                CudosMapCoursetoCourseInstructor.section_id.isnot(None)
-            )
-            .distinct()
-            .order_by(
-                MasterTypeDetails.mt_details_name
-            )
-            .all()
-        )
-
-        print("Sections found:", len(sections))
-
-        # Build response with consistent format
-        result = [
-            {
-                "value": section_id,
-                "label": section_name,
-            }
-            for section_id, section_name in sections
-        ]
-
-        print("Section result:", result)
-        print("=====================================\n")
-
-        # Return in same format as other endpoints
-        return {
-            "success": True,
-            "message": "Sections fetched successfully",
-            "data": result
-        }
-
-    except HTTPException as e:
-        return {
-            "success": False,
-            "message": str(e.detail),
-            "data": []
-        }
-
-    except Exception as e:
-        import traceback
-
-        print("\n========== SECTION LIST ERROR ==========")
-        print("Exception:", repr(e))
-        traceback.print_exc()
-        print("========================================\n")
-
-        return {
-            "success": False,
-            "message": str(e),
-            "data": []
-        }
-
-# -----------------------------
-# GET CUDOS TOPICS (Not yet imported)
-# -----------------------------
-@router.post("/cudos_topics")
-def get_cudos_topics(
-    academic_batch_id: int = Body(...),  # ← ADD THIS
-    course_id: int = Body(...),
-    semester_id: int = Body(...),
-    section_id: int = Body(...),
-    db: Session = Depends(get_db)
-):
-    """Get topics from cudos_topic that are NOT yet imported for this course/section"""
-    try:
-        # Get all topic IDs already imported for this course and section
-        imported_topic_ids = db.query(LMSMapInstructorTopic.topic_id).filter(
-            LMSMapInstructorTopic.crs_id == course_id,
-            LMSMapInstructorTopic.section_id == section_id,
-            LMSMapInstructorTopic.academic_batch_id == academic_batch_id  # ← ADD THIS
-        ).all()
-        
-        imported_ids = [t.topic_id for t in imported_topic_ids]
-        
-        # Get topics from cudos_topic that are NOT imported
-        query = db.query(CudosTopic).filter(
-            CudosTopic.course_id == course_id,
-            CudosTopic.semester_id == semester_id,
-            CudosTopic.academic_batch_id == academic_batch_id  # ← ADD THIS
-        )
-        
-        if imported_ids:
-            query = query.filter(~CudosTopic.topic_id.in_(imported_ids))
-        
-        topics = query.all()
-        
-        return [
-            {
-                "topic_id": t.topic_id,
-                "topic_code": t.topic_code,
-                "topic_title": t.topic_title,
-                "topic_hrs": t.topic_hrs,
-                "num_of_sessions": t.num_of_sessions,
-                "is_imported": False
-            }
-            for t in topics
-        ]
-    except Exception as e:
-        print(f"DEBUG: Error in cudos_topics: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-# =========================================================
-# ✅ IMPORT & LISTING
-# =========================================================
-
-@router.post("/import_topic")
-def import_topic(request: ImportTopicRequest, db: Session = Depends(get_db)):
-    """Import selected topics from cudos_topic to lms_map_instructor_topic with exact delta checking"""
-    try:
-        instructor_id = request.instructor_id
-
-        # 1. Fetch current topics from cudos_topic exactly as the frontend sees them
-        # Note: The frontend topic_list API only filters by course_id and semester_id
-        # This prevents the bug where newly added topics with mismatched or NULL academic_batch_ids are skipped.
-        topic_query = db.query(CudosTopic).filter(
-            CudosTopic.course_id == request.course_id,
-            CudosTopic.semester_id == request.semester_id
-        )
-        
-        # If client explicitly supplies topic_ids, restrict to those
-        if request.topic_ids and len(request.topic_ids) > 0:
-            topic_query = topic_query.filter(CudosTopic.topic_id.in_(request.topic_ids))
-            
-        candidate_topics = topic_query.all()
-        
-        if not candidate_topics:
-            return {
-                "success": False,
-                "message": "No valid topics found to import",
-                "importedTopics": 0,
-                "skippedTopics": 0
-            }
-
-        candidate_ids = [t.topic_id for t in candidate_topics]
-
-        # 2. Query lms_map_instructor_topic to find which ones are already mapped
-        already_mapped_query = db.query(LMSMapInstructorTopic.topic_id).filter(
-            LMSMapInstructorTopic.crs_id == request.course_id,
-            LMSMapInstructorTopic.section_id == request.section_id,
-            LMSMapInstructorTopic.topic_id.in_(candidate_ids)
-        ).all()
-        
-        already_mapped_ids = {row[0] for row in already_mapped_query}
-
-        # 3. Compare and identify new topics (Delta Check)
-        new_topics_to_insert = [t for t in candidate_topics if t.topic_id not in already_mapped_ids]
-
-        imported_count = 0
-        skipped_count = len(already_mapped_ids)
-
-        if not new_topics_to_insert:
-            # Subsequent Click (No Changes) behavior
-            return {
-                "success": False,
-                "message": "Topics already imported",
-                "importedTopics": 0,
-                "skippedTopics": skipped_count
-            }
-
-        # 4. Insert only missing records (idempotent delta behavior)
-        insert_mappings = []
-        for new_topic in new_topics_to_insert:
-            new_mapping = LMSMapInstructorTopic(
-                academic_batch_id=request.academic_batch_id,
-                semester_id=request.semester_id,
-                crs_id=request.course_id,
-                section_id=request.section_id,
-                topic_id=new_topic.topic_id,
-                instructor_id=instructor_id,
-                created_by=request.created_by
-            )
-            insert_mappings.append(new_mapping)
-            
-        db.bulk_save_objects(insert_mappings)
-        db.commit()
-        
-        imported_count = len(insert_mappings)
-        
-        # 5. Return structured response (avoiding generic "data" shell that stripping Axios interceptors remove)
-        return {
-            "success": True,
-            "message": "Topics imported successfully",
-            "importedTopics": imported_count,
-            "skippedTopics": skipped_count
-        }
-
-    except IntegrityError as e:
-        db.rollback()
-        logger.error(f"Integrity error during import: {e}")
-        return {
-            "success": False,
-            "message": "Database integrity error - possible foreign key violation",
-            "importedTopics": 0,
-            "skippedTopics": 0
-        }
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Import failed: {e}")
-        return {
-            "success": False,
-            "message": f"Import failed: {str(e)}",
-            "importedTopics": 0,
-            "skippedTopics": 0
-        }
-
-@router.post("/import_selected_topics")
-def import_selected_topics(request: ImportCudosTopicsRequest, db: Session = Depends(get_db)):
-    """Import selected topics from cudos_topic to lms_map_instructor_topic with idempotency"""
-    try:
-        logger.info(f"Import selected topics - academic_batch_id={request.academic_batch_id}, course_id={request.course_id}, semester_id={request.semester_id}, section_id={request.section_id}, instructor_id={request.instructor_id}, topic_ids={request.topic_ids}")
-
-        if not request.topic_ids:
-            return error_response("No topics selected for import")
-
-        # Verify that all selected topics exist in cudos_topic
-        existing_topics = db.query(CudosTopic.topic_id).filter(
-            CudosTopic.topic_id.in_(request.topic_ids)
-        ).all()
-        existing_topic_ids = {row.topic_id for row in existing_topics}
-
-        if len(existing_topic_ids) != len(request.topic_ids):
-            missing = set(request.topic_ids) - existing_topic_ids
-            logger.warning(f"Some topics do not exist in cudos_topic: {list(missing)}")
-            return error_response(f"Some topics do not exist in cudos_topic: {list(missing)}")
-
-        imported_count = 0
-        skipped_count = 0
-
-        for topic_id in request.topic_ids:
-            # STRICT DUPLICATE CHECK: Is this topic already mapped to this section?
-            # We check by topic_id and section_id to ensure a topic is only imported once per section.
-            exists = db.query(LMSMapInstructorTopic).filter(
-                LMSMapInstructorTopic.topic_id == topic_id,
-                LMSMapInstructorTopic.section_id == request.section_id,
-                LMSMapInstructorTopic.crs_id == request.course_id,
-                LMSMapInstructorTopic.academic_batch_id == request.academic_batch_id
-            ).first()
-
-            if exists:
-                skipped_count += 1
-                logger.info(f"Skipped topic {topic_id} - already exists for instructor {request.instructor_id}")
-            else:
-                new_mapping = LMSMapInstructorTopic(
-                    academic_batch_id=request.academic_batch_id,
-                    semester_id=request.semester_id,
-                    crs_id=request.course_id,
-                    section_id=request.section_id,
-                    topic_id=topic_id,
-                    instructor_id=request.instructor_id,
-                    created_by=request.created_by
-                )
-                db.add(new_mapping)
-                imported_count += 1
-                logger.info(f"Imported topic {topic_id} for instructor {request.instructor_id}")
-
-        db.commit()
-
-        logger.info(f"Import completed, {imported_count} new topics imported, {skipped_count} skipped")
-
-        return success_response({
-            "imported": imported_count,
-            "skipped": skipped_count,
-            "total_processed": len(request.topic_ids)
-        }, f"Successfully processed {len(request.topic_ids)} topics: {imported_count} imported, {skipped_count} skipped")
-
-    except IntegrityError as e:
-        db.rollback()
-        logger.error(f"Integrity error during import: {e}")
-        return error_response("Database integrity error - possible foreign key violation")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Import error: {e}")
-        return error_response(f"Import failed: {str(e)}")
-
-@router.post("/topic_list")
-def topic_list(request: TopicListRequest, db: Session = Depends(get_db)):
-    # List ALL topics for this course/semester from cudos_topic, with import status
-    try:
-        from sqlalchemy import or_, and_
-        # Base query from cudos_topic
-        query = db.query(CudosTopic)
-
-        # 1. Filter by Course/Semester/Batch
-        query = query.filter(
-            CudosTopic.academic_batch_id == request.academic_batch_id,
-            CudosTopic.course_id == request.course_id,
-            CudosTopic.semester_id == request.semester_id
-        )
-
-        # 2. Visibility Filter: Global OR Created By the current user
-        if request.user_id:
-            query = query.filter(
-                or_(
-                    CudosTopic.is_global == True,
-                    CudosTopic.created_by == request.user_id
-                )
-            )
-
-        # 3. Handle Mapping Status (if section_id is provided)
-        # We restrict the list to topics associated with this section (imported or portion exists)
-        if request.section_id:
-            query = query.filter(
-                or_(
-                    CudosTopic.topic_id.in_(
-                        db.query(LMSMapInstructorTopic.topic_id).filter(
-                            LMSMapInstructorTopic.section_id == request.section_id,
-                            LMSMapInstructorTopic.crs_id == request.course_id
-                        )
-                    ),
-                    CudosTopic.topic_id.in_(
-                        db.query(LMSMapPortionLS.topic_id).filter(LMSMapPortionLS.section_id == request.section_id)
-                    )
-                )
-            )
-        else:
-            # If no section selected, don't show any topics (optional, but safer based on requirements)
-            # pass
-            pass
-        
-        # Ensure distinct topics
-        query = query.distinct(CudosTopic.topic_id)
-        
-        topics = query.all()
-
-        print(f"DEBUG: Found {len(topics)} topics in cudos_topic for course_id={request.course_id}, semester_id={request.semester_id}")
-
-        if not topics:
-            return success_response([])
-
-        # Get imported mappings for this course/section
-        mappings = {}
-        if request.section_id:
-            imported_mappings = db.query(LMSMapInstructorTopic).filter(
-                LMSMapInstructorTopic.academic_batch_id == request.academic_batch_id,
-                LMSMapInstructorTopic.crs_id == request.course_id,
-                LMSMapInstructorTopic.semester_id == request.semester_id,
-                LMSMapInstructorTopic.section_id == request.section_id
-            ).all()
-            mappings = {m.topic_id: m for m in imported_mappings}
-
-        response = []
-        for topic in topics:
-            mapping = mappings.get(topic.topic_id)
-            
-            # Get instructor name if imported OR stored in schedule
-            instructor_name = "Not Assigned"
-            instructor_id = None
-            
-            # 1. Check mapping (Imported)
-            if mapping and mapping.instructor_id:
-                instructor_id = mapping.instructor_id
-            
-            # 2. If not imported, check schedule (Persisted assignment)
-            if not instructor_id:
-                # We'll fetch the schedule below, but for instructor name we might need it earlier
-                # Search for any schedule for this topic to get the persisted instructor
-                persisted_schedule = db.query(TopicLessonSchedule).filter(
-                    TopicLessonSchedule.topic_id == topic.topic_id,
-                    TopicLessonSchedule.section_id == request.section_id
-                ).first()
-                if persisted_schedule and persisted_schedule.instructor_id:
-                    instructor_id = persisted_schedule.instructor_id
-
-            if instructor_id:
-                instructor = db.query(IEMSUsers).filter(
-                    IEMSUsers.id == instructor_id
-                ).first()
-                if instructor:
-                    first_name = getattr(instructor, 'first_name', '') or ''
-                    last_name = getattr(instructor, 'last_name', '') or ''
-                    full_name = f"{first_name} {last_name}".strip()
-                    if full_name:
-                        instructor_name = full_name
-
-            # Get schedule details (imported or persisted)
-            schedule = None
-            schedule_query = db.query(TopicLessonSchedule).filter(
-                TopicLessonSchedule.topic_id == topic.topic_id
-            )
-            
-            # If mapping exists, try to find schedule for this specific section
-            if mapping and request.section_id:
-                schedule_query = schedule_query.join(
-                    LMSLessonSchedule,
-                    LMSLessonSchedule.lls_id == TopicLessonSchedule.lesson_schedule_id
-                ).filter(
-                    LMSLessonSchedule.section_id == request.section_id
-                )
-            
-            schedule = schedule_query.first()
-            
-            # If still no schedule (and possibly not imported), just get the record for this topic/section
-            if not schedule and request.section_id:
-                 schedule = db.query(TopicLessonSchedule).filter(
-                    TopicLessonSchedule.topic_id == topic.topic_id,
-                    TopicLessonSchedule.section_id == request.section_id
-                ).first()
-
-            # Get portion details and lesson schedule
-            portion_sql = """
-                SELECT portion_ref FROM lms_map_portion_ls 
-                WHERE topic_id = :topic_id AND portion_ref IS NOT NULL AND portion_ref != ''
-            """
-            portion_params = {"topic_id": topic.topic_id}
-            if request.section_id:
-                portion_sql += " AND section_id = :section_id"
-                portion_params["section_id"] = request.section_id
-
-            portion_list_query = db.execute(text(portion_sql), portion_params)
-            portion_refs = [r[0] for r in portion_list_query.fetchall() if r[0]]
-            lesson_schedule = ", ".join(portion_refs) if portion_refs else None
-
-            # Get marks_expt (handle if column doesn't exist)
-            try:
-                marks_sql = "SELECT marks_expt FROM lms_map_portion_ls WHERE topic_id = :topic_id"
-                marks_params = {"topic_id": topic.topic_id}
-                if request.section_id:
-                    marks_sql += " AND section_id = :section_id"
-                    marks_params["section_id"] = request.section_id
-                marks_sql += " LIMIT 1"
-
-                portion_query = db.execute(text(marks_sql), marks_params)
-                portion_row = portion_query.fetchone()
-                marks_expt = portion_row[0] if portion_row else None
-            except Exception as e:
-                print(f"Warning: Could not get marks_expt for topic {topic.topic_id}: {e}")
-                marks_expt = None
-
-            response.append({
-                "topic_id": topic.topic_id,
-                "mapping_id": mapping.inst_map_id if mapping else None,
-                "inst_map_id": mapping.inst_map_id if mapping else None,
-                "topic_code": topic.topic_code,
-                "topic_title": topic.topic_title,
-                "topic_content": topic.topic_content,
-                "topic_hrs": topic.topic_hrs,
-                "num_of_sessions": topic.num_of_sessions,
-                "section_id": request.section_id,
-                "instructor_id": instructor_id,
-                "instructor_name": instructor_name,
-                "lesson_schedule": lesson_schedule,
-                "conduction_date": (schedule.conduction_date.isoformat() if hasattr(schedule.conduction_date, 'isoformat') else str(schedule.conduction_date)) if schedule and schedule.conduction_date else None,
-                "actual_delivery_date": (schedule.actual_delivery_date.isoformat() if hasattr(schedule.actual_delivery_date, 'isoformat') else str(schedule.actual_delivery_date)) if schedule and schedule.actual_delivery_date else None,
-                "marks_expt": marks_expt,
-                "is_imported": mapping is not None  # Add flag to indicate import status
-            })
-        
-        print(f"DEBUG: Returning {len(response)} topics")
-        return success_response(response)
-
-    except Exception as e:
-        print(f"DEBUG: Error in topic_list: {e}")
-        return error_response(str(e))
-
-# -----------------------------
-# UPDATE — Topic
-# -----------------------------
-@router.put("/update_topic/{topic_id}")
-def update_topic(topic_id: int, request: TopicCreateRequest, db: Session = Depends(get_db)):
-    topic = db.query(CudosTopic).filter(
-        CudosTopic.topic_id == topic_id
-    ).first()
-
-    if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
-
-    try:
-        topic.topic_code = request.topic_code
-        topic.topic_title = request.topic_title
-        topic.topic_content = request.topic_content
-        topic.academic_batch_id = request.academic_batch_id
-        topic.semester_id = request.semester_id
-        topic.course_id = request.course_id
-        topic.modified_by = request.created_by
-        topic.modified_date = date.today()
-
-        db.commit()
-        db.refresh(topic)
-        print(f"✅ Topic {topic_id} updated successfully")
-
-        return {"message": "Topic updated successfully", "topic_id": topic_id}
-
-    except Exception as e:
-        db.rollback()
-        print(f"❌ update_topic/{topic_id} ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
-
-
-# -----------------------------
-# DELETE — Topic
-# -----------------------------
-@router.delete("/delete_topic/{topic_id}")
-def delete_topic(topic_id: int, db: Session = Depends(get_db)):
-
-    topic = db.query(CudosTopic).filter(
-        CudosTopic.topic_id == topic_id
-    ).first()
-
-    if not topic:
-        raise HTTPException(status_code=404, detail="Topic not found")
-
-    try:
-        db.delete(topic)
-        db.commit()
-        return {"message": "Topic deleted successfully"}
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# =========================================================
-# ✅ NEW ENDPOINTS FOR MANAGE TOPIC INSTRUCTOR
-# =========================================================
-
-# -----------------------------
-# GET INSTRUCTOR LIST
-# -----------------------------
-@router.get("/instructor_list")
-def instructor_list(db: Session = Depends(get_db)):
-    try:
-        # First try to get instructors from CudosMapCoursetoCourseInstructor with DISTINCT
-        instructors = db.query(
-            CudosMapCoursetoCourseInstructor.course_instructor_id,
-            IEMSUsers.first_name,
-            IEMSUsers.last_name
-        ).join(
-            IEMSUsers,
-            IEMSUsers.id == CudosMapCoursetoCourseInstructor.course_instructor_id
-        ).distinct().all()
-
-        # If no instructors found, fallback to all users from IEMSUsers
-        if not instructors:
-            users = db.query(IEMSUsers).all()
-            return [
-                {
-                    "value": u.id,
-                    "label": f"{u.first_name} {u.last_name}".strip() or u.username
-                }
-                for u in users
-            ]
-
-        # Use a dict to remove duplicates by instructor_id
-        seen = {}
-        result = []
-        for inst in instructors:
-            if inst.course_instructor_id not in seen:
-                seen[inst.course_instructor_id] = True
-                result.append({
-                    "value": inst.course_instructor_id,
-                    "label": f"{inst.first_name} {inst.last_name}".strip()
-                })
-
-        return result
-
-    except Exception as e:
-        print("Error in instructor_list:", e)
-        # Fallback: get all users from IEMSUsers
-        try:
-            users = db.query(IEMSUsers).all()
-            return [
-                {
-                    "value": u.id,
-                    "label": f"{u.first_name} {u.last_name}".strip() or u.username
-                }
-                for u in users
-            ]
-        except Exception as fallback_error:
-            print("Fallback error:", fallback_error)
-            raise HTTPException(status_code=500, detail=str(e))
-# -----------------------------
-# UPDATE INSTRUCTOR
-# -----------------------------
-@router.put("/update_instructor/{mapping_id}")
-def update_instructor(
-    mapping_id: int,
-    request: UpdateInstructorRequest,
-    db: Session = Depends(get_db)
-):
-    course_instructor_id = request.course_instructor_id or request.instructor_id
-    if not course_instructor_id:
-        raise HTTPException(status_code=422, detail='instructor_id or course_instructor_id required')
-    try:
-
-        mapping = db.query(LMSMapInstructorTopic).filter(
-            LMSMapInstructorTopic.inst_map_id == mapping_id
-        ).first()
-
-        if not mapping:
-            raise HTTPException(status_code=404, detail="Mapping not found")
-
-        mapping.instructor_id = request.course_instructor_id
-
-        db.commit()
-        db.refresh(mapping)
-
-        return {
-            "status": "success",
-            "message": "Instructor updated successfully"
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-# -----------------------------
-# GET CUDOS TOPICS (Not yet imported)
-# -----------------------------
-@router.post("/cudos_topics")
-def get_cudos_topics(
-    course_id: int = Body(...),
-    semester_id: int = Body(...),
-    section_id: int = Body(...),
-    db: Session = Depends(get_db)
-):
-    """Get topics from cudos_topic that are NOT yet imported for this course/section"""
-    try:
-        # Get all topic IDs already imported for this course and section
-        imported_topic_ids = db.query(LMSMapInstructorTopic.topic_id).filter(
-            LMSMapInstructorTopic.crs_id == course_id,
-            LMSMapInstructorTopic.section_id == section_id
-        ).all()
-        
-        imported_ids = [t.topic_id for t in imported_topic_ids]
-        
-        # Get topics from cudos_topic that are NOT imported
-        query = db.query(CudosTopic).filter(
-            CudosTopic.course_id == course_id,
-            CudosTopic.semester_id == semester_id
-        )
-        
-        if imported_ids:
-            query = query.filter(~CudosTopic.topic_id.in_(imported_ids))
-        
-        topics = query.all()
-        
-        return [
-            {
-                "topic_id": t.topic_id,
-                "topic_code": t.topic_code,
-                "topic_title": t.topic_title,
-                "topic_hrs": t.topic_hrs,
-                "num_of_sessions": t.num_of_sessions
-            }
-            for t in topics
-        ]
-    except Exception as e:
-        print(f"DEBUG: Error in cudos_topics: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# IMPORT SELECTED CUDOS TOPICS WITH INSTRUCTOR
-# -----------------------------
-@router.post("/import_cudos_topics")
-def import_cudos_topics(
-    course_id: int = Body(...),
-    semester_id: int = Body(...),
-    section_id: int = Body(...),
-    topic_ids: list = Body(...),
-    instructor_id: int = Body(...),
-    academic_batch_id: int = Body(...),
-    created_by: int = Body(1),
-    db: Session = Depends(get_db)
-):
-    """Import selected topics from cudos_topic with instructor assignment"""
-    try:
-        imported_count = 0
-        imported_mappings = []
-        
-        for topic_id in topic_ids:
-            # Check if already imported
-            exists = db.query(LMSMapInstructorTopic).filter(
-                LMSMapInstructorTopic.topic_id == topic_id,
-                LMSMapInstructorTopic.crs_id == course_id,
-                LMSMapInstructorTopic.section_id == section_id
-            ).first()
-            
-            if not exists:
-                new_mapping = LMSMapInstructorTopic(
-                    academic_batch_id=academic_batch_id,
-                    semester_id=semester_id,
-                    crs_id=course_id,
-                    section_id=section_id,
-                    topic_id=topic_id,
-                    instructor_id=instructor_id,
-                    created_by=created_by
-                )
-                db.add(new_mapping)
-                db.flush()  # Get the ID before commit
-                imported_mappings.append({
-                    "topic_id": topic_id,
-                    "mapping_id": new_mapping.inst_map_id
-                })
-                imported_count += 1
-        
-        db.commit()
-        
-        if imported_count == 0:
-            return {"status": "success", "message": "All selected topics already imported", "data": []}
-        
-        return {
-            "status": "success", 
-            "message": f"Successfully imported {imported_count} topics",
-            "data": imported_mappings
-        }
-    
-    except Exception as e:
-        db.rollback()
-        print(f"DEBUG: Error in import_cudos_topics: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# GET TOPIC SCHEDULES
-# -----------------------------
-@router.post("/topic_schedules")
-def get_topic_schedules(
-    mapping_id: int = Body(..., embed=True),
-    db: Session = Depends(get_db)
-):
-    """Get lesson schedules for a specific topic mapping"""
-    try:
-        # Get the mapping to find the topic_id
-        mapping = db.query(LMSMapInstructorTopic).filter(
-            LMSMapInstructorTopic.inst_map_id == mapping_id
-        ).first()
-        
-        if not mapping:
-            raise HTTPException(status_code=404, detail="Topic mapping not found")
-        
-        # Get schedules for this topic (from topic_lesson_schedule + lms_map_portion_ls for portion_ref)
-        from sqlalchemy import text
-        schedules = db.query(TopicLessonSchedule).filter(
-            TopicLessonSchedule.topic_id == mapping.topic_id
-        ).order_by(TopicLessonSchedule.lesson_schedule_id).all()
-
-        # Get all portions for this topic (portion_ref) - match by index with schedules
-        portion_refs = []
-        try:
-            portion_rows = db.execute(text("""
-                SELECT portion_ref FROM lms_map_portion_ls 
-                WHERE topic_id = :topic_id AND portion_ref IS NOT NULL AND portion_ref != ''
-                ORDER BY portion_id
-            """), {"topic_id": mapping.topic_id}).fetchall()
-            portion_refs = [r[0] for r in portion_rows if r[0]]
-        except Exception:
-            pass
-
-        result = []
-        for idx, s in enumerate(schedules):
-            portion_ref = portion_refs[idx] if idx < len(portion_refs) else None
-            result.append({
-                "schedule_id": s.lesson_schedule_id,
-                "topic_id": s.topic_id,
-                "session_number": idx + 1,
-                "portion_to_be_covered": portion_ref,
-                "conduction_date": s.conduction_date.isoformat() if s.conduction_date else None,
-                "actual_delivery_date": s.actual_delivery_date.isoformat() if s.actual_delivery_date else None,
-            })
-        return result
-    except Exception as e:
-        print(f"DEBUG: Error in topic_schedules: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# UPDATE SCHEDULE
-# -----------------------------
-@router.put("/update_schedule/{schedule_id}")
-def update_schedule(
-    schedule_id: int,
-    conduction_date: str = Body(None),
-    actual_delivery_date: str = Body(None),
-    db: Session = Depends(get_db)
-):
-    """Update a lesson schedule"""
-    try:
-        schedule = db.query(TopicLessonSchedule).filter(
-            TopicLessonSchedule.lesson_schedule_id == schedule_id
-        ).first()
-        
-        if not schedule:
-            raise HTTPException(status_code=404, detail="Schedule not found")
-        
-        if conduction_date:
-            schedule.conduction_date = datetime.strptime(conduction_date, '%Y-%m-%d').date()
-        if actual_delivery_date:
-            schedule.actual_delivery_date = datetime.strptime(actual_delivery_date, '%Y-%m-%d').date()
-        
-        db.commit()
-        db.refresh(schedule)
-        
-        return {"status": "success", "message": "Schedule updated successfully"}
-    except Exception as e:
-        db.rollback()
-        print(f"DEBUG: Error in update_schedule: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# UPDATE PORTION
-# -----------------------------
-@router.put("/update_portion/{portion_id}")
-def update_portion(
-    portion_id: int,
-    portion_ref: Optional[str] = Body(None),
-    marks_expt: Optional[float] = Body(None),
-    planned_date: str = Body(None),
-    db: Session = Depends(get_db)
-):
-    """Update a portion schedule"""
-    try:
-        portion = db.query(LMSMapPortionLS).filter(
-            LMSMapPortionLS.portion_id == portion_id
-        ).first()
-        
-        if not portion:
-            raise HTTPException(status_code=404, detail="Portion not found")
-        
-        if portion_ref is not None:
-            portion.portion_ref = portion_ref
-        if planned_date:
-            portion.planned_date = datetime.strptime(planned_date, '%Y-%m-%d').date()
-        
-        db.commit()
-        db.refresh(portion)
-        
-        return {"status": "success", "message": "Portion updated successfully"}
-    except Exception as e:
-        db.rollback()
-        print(f"DEBUG: Error in update_portion: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# ADD NEW SCHEDULE
-# -----------------------------
-@router.post("/add_schedule")
-def add_schedule(
-    request: AddScheduleRequest,
-    db: Session = Depends(get_db)
-):
-    """Add a new lesson schedule for a topic mapping"""
-    try:
-        # Get the mapping to find the topic_id and academic_batch_id
-        mapping = db.query(LMSMapInstructorTopic).filter(
-            LMSMapInstructorTopic.inst_map_id == request.mapping_id
-        ).first()
-        
-        if not mapping:
-            raise HTTPException(status_code=404, detail="Topic mapping not found")
-        
-        # Determine academic_batch_id: use request one if provided, else use the one from mapping
-        academic_batch_id = request.academic_batch_id or mapping.academic_batch_id
-        
-        if not academic_batch_id:
-            # Should not happen as LMSMapInstructorTopic usually has it, but good to have a check
-            raise HTTPException(
-                status_code=400, 
-                detail="academic_batch_id is required but not provided in request and missing in mapping"
-            )
-
-        new_schedule = TopicLessonSchedule(
-            topic_id=mapping.topic_id,
-            academic_batch_id=academic_batch_id,
-            course_id=mapping.crs_id,
-            conduction_date=request.conduction_date,
-            created_by=request.created_by
-        )
-        
-        db.add(new_schedule)
-        db.commit()
-        db.refresh(new_schedule)
-        
-        return {
-            "status": "success", 
-            "message": "Schedule added successfully",
-            "schedule_id": new_schedule.lesson_schedule_id
-        }
-    except Exception as e:
-        db.rollback()
-        print(f"DEBUG: Error in add_schedule: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# -----------------------------
-# ADD EXTRA CLASS
-# -----------------------------
-@router.post("/add_extra_class")
-def add_extra_class(
-    mapping_id: int = Body(...),
-    class_date: str = Body(...),
-    start_time: Optional[str] = Body(None),
-    end_time: Optional[str] = Body(None),
-    notes: Optional[str] = Body(None),
-    db: Session = Depends(get_db)
-):
-    """Add an extra class to topic lesson schedule"""
-    try:
-        # Get the mapping to find topic_id
-        mapping = db.query(LMSMapInstructorTopic).filter(
-            LMSMapInstructorTopic.inst_map_id == mapping_id
-        ).first()
-
-        if not mapping:
-            raise HTTPException(status_code=404, detail="Mapping not found")
-
-        # Create new lesson schedule for extra class
-        lesson = TopicLessonSchedule(
-            topic_id=mapping.topic_id,
-            academic_batch_id=mapping.academic_batch_id,
-            course_id=mapping.crs_id,
-            conduction_date=datetime.strptime(class_date, "%Y-%m-%d").date() if class_date else None,
-            created_by=mapping.created_by
-        )
-
-        db.add(lesson)
+router = APIRouter(tags=['Topic Management'])
+
+def success(data=None, message='Success'):
+    return {'success': True, 'data': data, 'message': message}
+
+def actor(user):
+    user_id = user.get('user_id') or user.get('id')
+    if not user_id:
+        raise HTTPException(401, 'Authentication required')
+    return int(user_id)
+
+def mapping_query(db, context):
+    return db.query(LMSMapInstructorTopic).filter_by(
+        academic_batch_id=context.academic_batch_id, semester_id=context.semester_id,
+        crs_id=context.course_id, section_id=context.section_id)
+
+def topic_query(db, context):
+    return db.query(CudosTopic).filter_by(academic_batch_id=context.academic_batch_id,
+        semester_id=context.semester_id, crs_id=context.course_id)
+
+def validate_context(db, context):
+    semester = db.query(IEMSemester).filter_by(semester_id=context.semester_id,
+        academic_batch_id=context.academic_batch_id).first()
+    course = db.query(IEMSCourses).filter_by(crs_id=context.course_id,
+        academic_batch_id=context.academic_batch_id).first()
+    if not semester or not course or course.semester != semester.semester:
+        raise HTTPException(422, 'Course, semester and academic batch do not match')
+    if not db.query(CudosMapCoursetoCourseInstructor).filter_by(
+        academic_batch_id=context.academic_batch_id, semester_id=context.semester_id,
+        crs_id=context.course_id, section_id=context.section_id).first():
+        raise HTTPException(422, 'Section is not assigned to this course')
+    return course
+
+def validate_instructor(db, context, instructor_id):
+    if not instructor_id or not db.query(CudosMapCoursetoCourseInstructor).filter_by(
+        academic_batch_id=context.academic_batch_id, semester_id=context.semester_id,
+        crs_id=context.course_id, section_id=context.section_id,
+        course_instructor_id=instructor_id).first():
+        raise HTTPException(422, 'Select an instructor assigned to this course and section')
+
+def get_mapping(db, mapping_id):
+    mapping = db.query(LMSMapInstructorTopic).filter_by(inst_map_id=mapping_id).first()
+    if not mapping:
+        raise HTTPException(404, 'Topic mapping not found')
+    return mapping
+
+def context_for(mapping):
+    return TopicContext(academic_batch_id=mapping.academic_batch_id,
+        semester_id=mapping.semester_id, course_id=mapping.crs_id,
+        section_id=mapping.section_id)
+
+def portions(db, mapping):
+    return db.query(LMSMapPortionLS).filter_by(topic_id=mapping.topic_id,
+        section_id=mapping.section_id).order_by(LMSMapPortionLS.portion_id).all()
+
+def serialize_portion(p, index):
+    return {'schedule_id': p.portion_id, 'portion_id': p.portion_id,
+        'lesson_schedule_id': p.lesson_schedule_id, 'topic_id': p.topic_id,
+        'session_number': int(p.portion_ref) if (p.portion_ref or '').isdigit() else index,
+        'portion_to_be_covered': p.portion_per_hour or '',
+        'conduction_date': p.planned_date, 'actual_delivery_date': p.delivery_date,
+        'start_time': p.start_time, 'end_time': p.end_time}
+
+def seed_portions(db, context, topic, user_id):
+    existing = db.query(LMSMapPortionLS).filter_by(topic_id=topic.topic_id,
+        section_id=context.section_id).all()
+    # Source schedule IDs always refer to cudos_topic_lesson_schedule.
+    source = db.query(CudosTopicLessonSchedule).filter_by(topic_id=topic.topic_id,
+        academic_batch_id=context.academic_batch_id, crs_id=context.course_id).all()
+    saved = {p.lesson_schedule_id for p in existing if p.lesson_schedule_id}
+    for s in source:
+        if s.lesson_schedule_id not in saved:
+            db.add(LMSMapPortionLS(topic_id=topic.topic_id, section_id=context.section_id,
+                lesson_schedule_id=s.lesson_schedule_id, portion_ref=s.portion_ref,
+                portion_per_hour=s.portion_per_hour or '', planned_date=s.conduction_date,
+                delivery_date=s.actual_delivery_date, created_by=user_id, created_date=datetime.now()))
+    if not source and not existing:
+        legacy = db.execute(text("""SELECT lesson_schedule_id,portion_ref,portion_per_hour,
+            conduction_date,actual_delivery_date FROM topic_lesson_schedule
+            WHERE topic_id=:topic AND academic_batch_id=:batch AND course_id=:course"""),
+            {'topic': topic.topic_id, 'batch': context.academic_batch_id, 'course': context.course_id}).mappings().all()
+        count = len(legacy) or max(1, int(topic.num_of_sessions or 1))
+        for index in range(count):
+            old = legacy[index] if legacy else None
+            db.add(LMSMapPortionLS(topic_id=topic.topic_id, section_id=context.section_id,
+                lesson_schedule_id=old['lesson_schedule_id'] if old else None,
+                portion_ref=old['portion_ref'] if old else str(index + 1),
+                portion_per_hour=old['portion_per_hour'] if old else topic.topic_content or '',
+                planned_date=old['conduction_date'] if old else topic.conduction_date,
+                delivery_date=old['actual_delivery_date'] if old else None,
+                created_by=user_id, created_date=datetime.now()))
+
+def assign(db, request, user_id):
+    validate_context(db, request)
+    result = []
+    for assignment in request.assignments:
+        topic = topic_query(db, request).filter_by(topic_id=assignment.topic_id).with_for_update().first()
+        if not topic:
+            raise HTTPException(422, 'A selected topic does not belong to this course and semester')
+        existing_instructors = {r.instructor_id for r in mapping_query(db, request).filter_by(topic_id=topic.topic_id).all() if r.instructor_id}
+        if len(existing_instructors | set(assignment.instructor_ids)) > 3:
+            raise HTTPException(422, 'A topic can have at most three instructors')
+        for instructor_id in set(assignment.instructor_ids):
+            validate_instructor(db, request, instructor_id)
+            mapping = mapping_query(db, request).filter_by(topic_id=topic.topic_id,
+                instructor_id=instructor_id).first()
+            if not mapping:
+                mapping = LMSMapInstructorTopic(academic_batch_id=request.academic_batch_id,
+                    semester_id=request.semester_id, crs_id=request.course_id,
+                    section_id=request.section_id, topic_id=topic.topic_id,
+                    instructor_id=instructor_id, created_by=user_id, created_date=datetime.now())
+                db.add(mapping)
+                db.flush()
+            result.append({'topic_id': topic.topic_id, 'mapping_id': mapping.inst_map_id,
+                'instructor_id': instructor_id})
+        seed_portions(db, request, topic, user_id)
         db.flush()
+    return result
 
-        # Add corresponding portion
-        portion = LMSMapPortionLS(
-            topic_id=mapping.topic_id,
-            section_id=mapping.section_id,
-            lesson_schedule_id=lesson.lesson_schedule_id,
-            portion_ref="Extra",
-            portion_per_hour="0",
-            planned_date=lesson.conduction_date,
-            created_by=mapping.created_by
-        )
-        db.add(portion)
+@router.post('/curriculum_list')
+def curriculum_list(db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    return success([{'value': r.academic_batch_id,
+        'label': r.academic_batch_desc or str(r.academic_batch_id)}
+        for r in db.query(IEMSAcademicBatch).all()])
 
-        db.commit()
+@router.post('/semester_list')
+def semester_list(request: dict = Body(...), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    query = db.query(IEMSemester)
+    if request.get('academic_batch_id'):
+        query = query.filter_by(academic_batch_id=request['academic_batch_id'])
+    return success([{'value': s.semester_id, 'label': s.semester_desc or f'Semester {s.semester}'}
+        for s in query.order_by(IEMSemester.semester).all()])
 
-        return {"message": "Extra class added successfully", "schedule_id": lesson.lesson_schedule_id}
+@router.post('/course_list')
+def course_list(request: dict = Body(...), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    batch = request.get('academic_batch_id') or request.get('curriculum_id')
+    query = db.query(IEMSCourses)
+    if batch:
+        query = query.filter_by(academic_batch_id=batch)
+    if request.get('semester_id'):
+        sem_query = db.query(IEMSemester).filter_by(semester_id=request['semester_id'])
+        if batch:
+            sem_query = sem_query.filter_by(academic_batch_id=batch)
+        semester = sem_query.first()
+        if not semester:
+            return success([])
+        query = query.filter_by(semester=semester.semester)
+    return success([{'value': c.crs_id, 'label': f'{c.crs_code} - {c.crs_title}',
+        'lms_topic_import_type_flag': c.lms_topic_import_type_flag} for c in query.all()])
 
-    except Exception as e:
-        db.rollback()
-        print(f"ERROR in add_extra_class: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@router.post('/section_list')
+def section_list(request: dict = Body(...), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    rows = db.query(MasterTypeDetails).join(CudosMapCoursetoCourseInstructor,
+        MasterTypeDetails.mt_details_id == CudosMapCoursetoCourseInstructor.section_id).filter(
+        CudosMapCoursetoCourseInstructor.academic_batch_id == request.get('academic_batch_id'),
+        CudosMapCoursetoCourseInstructor.semester_id == request.get('semester_id'),
+        CudosMapCoursetoCourseInstructor.crs_id == request.get('course_id')).distinct().all()
+    return success([{'value': r.mt_details_id, 'label': r.mt_details_name} for r in rows])
 
+@router.post('/instructor_list')
+def instructor_list(request: dict = Body(...), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    query = db.query(IEMSUsers).join(CudosMapCoursetoCourseInstructor,
+        IEMSUsers.id == CudosMapCoursetoCourseInstructor.course_instructor_id).filter(
+        CudosMapCoursetoCourseInstructor.crs_id == request.get('course_id'))
+    for key in ('academic_batch_id', 'semester_id', 'section_id'):
+        if request.get(key):
+            query = query.filter(getattr(CudosMapCoursetoCourseInstructor, key) == request[key])
+    return success([{'value': r.id, 'label': ' '.join(filter(None, [r.first_name, r.last_name])) or r.username}
+        for r in query.distinct().all()])
 
+@router.post('/topic_list')
+def topic_list(request: TopicListRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    validate_context(db, request)
+    result = []
+    for topic in topic_query(db, request).order_by(CudosTopic.topic_id).all():
+        maps = mapping_query(db, request).filter_by(topic_id=topic.topic_id).all()
+        if not maps or (request.instructor_id and request.instructor_id not in [m.instructor_id for m in maps]):
+            continue
+        instructors = db.query(IEMSUsers).filter(IEMSUsers.id.in_([m.instructor_id for m in maps])).all()
+        ps = portions(db, maps[0])
+        result.append({'topic_id': topic.topic_id, 'mapping_id': maps[0].inst_map_id,
+            'course_id': topic.crs_id, 'section_id': request.section_id,
+            'topic_code': topic.topic_code, 'topic_title': topic.topic_title,
+            'topic_content': topic.topic_content, 'topic_hrs': topic.topic_hrs,
+            'num_of_sessions': topic.num_of_sessions, 'marks_expt': topic.marks_expt,
+            'instructor_id': maps[0].instructor_id, 'instructor_ids': [m.instructor_id for m in maps],
+            'instructor_name': ', '.join(' '.join(filter(None, [i.first_name, i.last_name])) or i.username for i in instructors),
+            'lesson_schedule': ', '.join(p.portion_per_hour for p in ps if p.portion_per_hour),
+            'portions': [serialize_portion(p, n) for n, p in enumerate(ps, 1)],
+            'actual_delivery_date': max((p.delivery_date for p in ps if p.delivery_date), default=None),
+            'is_imported': True})
+    return success(result)
 
-# ==============================
-# API 13 – Add New Topic
-# ==============================
-@router.post("/add_new_topic")
-def add_new_topic(
-    academic_batch_id: int = Body(...),
-    semester_id: int = Body(...),
-    course_id: int = Body(...),
-    section_id: int = Body(...),
-    topic_title: str = Body(...),
-    topic_code: str = Body(...),
-    topic_content: Optional[str] = Body(None),
-    topic_hrs: Optional[str] = Body(None),
-    num_of_sessions: int = Body(1),
-    instructor_id: int = Body(...),
-    created_by: int = Body(1),
-    is_global: bool = Body(True),
-    delivery_date: Optional[str] = Body(None),
-    db: Session = Depends(get_db)
-):
-    """Add a new topic without auto-importing to LMS mapping"""
+@router.post('/cudos_topics')
+def cudos_topics(request: TopicContext, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    validate_context(db, request)
+    section = db.query(MasterTypeDetails).filter_by(mt_details_id=request.section_id).first()
+    owner = db.query(CudosMapCoursetoCourseInstructor).filter_by(
+        academic_batch_id=request.academic_batch_id, semester_id=request.semester_id,
+        crs_id=request.course_id, section_id=request.section_id).filter(
+        CudosMapCoursetoCourseInstructor.course_instructor_id.isnot(None)).order_by(
+        CudosMapCoursetoCourseInstructor.mcci_id).first()
+    result = []
+    for topic in topic_query(db, request).all():
+        if bool(topic.category_id) != bool(section.parent_id):
+            continue
+        mapped = mapping_query(db, request).filter_by(topic_id=topic.topic_id).all()
+        has_portions = bool(db.query(LMSMapPortionLS.portion_id).filter_by(
+            topic_id=topic.topic_id, section_id=request.section_id).first())
+        if not has_portions:
+            has_portions = bool(db.query(CudosTopicLessonSchedule.lesson_schedule_id).filter_by(
+                topic_id=topic.topic_id, academic_batch_id=request.academic_batch_id,
+                crs_id=request.course_id).first())
+        if not has_portions:
+            has_portions = bool(db.execute(text("""SELECT lesson_schedule_id FROM topic_lesson_schedule
+                WHERE topic_id=:topic AND academic_batch_id=:batch AND course_id=:course LIMIT 1"""),
+                {'topic': topic.topic_id, 'batch': request.academic_batch_id, 'course': request.course_id}).first())
+        result.append({'topic_id': topic.topic_id, 'topic_code': topic.topic_code,
+            'topic_title': topic.topic_title, 'topic_hrs': topic.topic_hrs,
+            'num_of_sessions': topic.num_of_sessions, 'has_portions': has_portions,
+            'instructor_ids': [m.instructor_id for m in mapped if m.instructor_id],
+            'default_instructor_id': owner.course_instructor_id if owner else None})
+    return success(result)
+
+@router.post('/assign_topics')
+def assign_topics(request: AssignTopicsRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     try:
-        # Create topic in cudos_topic
-        new_topic = CudosTopic(
-            topic_code=topic_code,
-            topic_title=topic_title,
-            topic_content=topic_content or "",
-            academic_batch_id=academic_batch_id,
-            semester_id=semester_id,
-            course_id=course_id,
-            topic_hrs=topic_hrs,
-            num_of_sessions=num_of_sessions,
-            conduction_date=datetime.strptime(delivery_date, '%Y-%m-%d').date() if delivery_date else None,
-            actual_delivery_date=datetime.strptime(delivery_date, '%Y-%m-%d').date() if delivery_date else None,
-            created_by=created_by,
-            is_global=is_global,
-            created_date=datetime.now()
-        )
-
-        db.add(new_topic)
+        data = assign(db, request, actor(user))
         db.commit()
-        db.refresh(new_topic)
-
-        # Decoupled: NOT auto-importing to LMS mapping. Let user approve via "Import Topics".
-        
-        # Calculate portion_per_hour = topic_hrs / num_of_sessions
-        topic_hrs_float = 0.0
-        try:
-            if topic_hrs:
-                topic_hrs_float = float(topic_hrs)
-        except (ValueError, TypeError):
-            topic_hrs_float = 0.0
-            
-        num_sessions = int(num_of_sessions) if num_of_sessions and int(num_of_sessions) > 0 else 1
-        portion_per_hour = topic_hrs_float / num_sessions
-
-        # Add default topic lesson schedule
-        new_schedule = TopicLessonSchedule(
-            topic_id=new_topic.topic_id,
-            academic_batch_id=academic_batch_id,
-            course_id=course_id,
-            section_id=section_id,
-            portion_per_hour=portion_per_hour,
-            conduction_date=new_topic.conduction_date,
-            actual_delivery_date=new_topic.actual_delivery_date,
-            instructor_id=instructor_id,
-            created_by=created_by,
-            created_date=datetime.now()
-        )
-        db.add(new_schedule)
-        db.flush()
-
-        # Add default portion
-        new_portion = LMSMapPortionLS(
-            topic_id=new_topic.topic_id,
-            section_id=section_id,
-            lesson_schedule_id=new_schedule.lesson_schedule_id,
-            portion_ref="",
-            portion_per_hour=str(portion_per_hour),
-            created_by=created_by,
-            created_date=datetime.now()
-        )
-        db.add(new_portion)
-
-        db.commit()
-
-        return {
-            "message": "Topic added successfully (Needs Import)",
-            "topic_id": new_topic.topic_id,
-            "mapping_id": None
-        }
-
-    except Exception as e:
+        return success(data, 'Topics assigned successfully')
+    except Exception:
         db.rollback()
-        print(f"ERROR in add_new_topic: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise
 
+@router.post('/import_topic')
+@router.post('/import_selected_topics')
+@router.post('/import_cudos_topics')
+def import_topics(request: ImportTopicRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    return assign_topics(AssignTopicsRequest(**request.model_dump(), assignments=[
+        TopicAssignment(topic_id=t, instructor_ids=[request.instructor_id]) for t in set(request.topic_ids)]), db, user)
 
-# ==============================
-# API – Update Mapping (Assign Instructor)
-# ==============================
-@router.put("/update_mapping/{mapping_id}")
-def update_mapping(
-    mapping_id: int,
-    request: UpdateInstructorRequest,
-    db: Session = Depends(get_db)
-):
-    """Update mapping to assign instructor"""
-    instructor_id = request.instructor_id or request.course_instructor_id
-    if not instructor_id:
-        raise HTTPException(status_code=422, detail="instructor_id or course_instructor_id required")
-        
+@router.put('/update_mapping/{mapping_id}')
+@router.put('/update_instructor/{mapping_id}')
+def update_instructor(mapping_id: int, request: UpdateInstructorRequest,
+        db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
     try:
-        mapping = db.query(LMSMapInstructorTopic).filter(
-            LMSMapInstructorTopic.inst_map_id == mapping_id
-        ).first()
- 
-        if not mapping:
-            raise HTTPException(status_code=404, detail="Mapping not found")
- 
+        mapping = get_mapping(db, mapping_id)
+        instructor_id = request.instructor_id or request.course_instructor_id
+        validate_instructor(db, context_for(mapping), instructor_id)
+        duplicate = mapping_query(db, context_for(mapping)).filter_by(
+            topic_id=mapping.topic_id, instructor_id=instructor_id).first()
+        if duplicate and duplicate.inst_map_id != mapping_id:
+            raise HTTPException(409, 'Instructor already assigned to this topic')
         mapping.instructor_id = instructor_id
+        mapping.modified_by = actor(user)
+        mapping.modified_date = datetime.now()
         db.commit()
- 
-        return {"status": "success", "message": "Instructor assigned successfully"}
- 
-    except Exception as e:
+        return success(message='Instructor updated')
+    except Exception:
         db.rollback()
-        print(f"ERROR in update_mapping: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise
+
+@router.put('/update_topic/{topic_id}')
+def update_topic(topic_id: int, request: TopicCreateRequest,
+        db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    topic = topic_query(db, request).filter_by(topic_id=topic_id).first()
+    if not topic:
+        raise HTTPException(404, 'Topic not found in this academic context')
+    try:
+        for field in ('topic_code', 'topic_title', 'topic_content', 'topic_hrs', 'num_of_sessions'):
+            if field in request.model_fields_set:
+                setattr(topic, field, getattr(request, field))
+        topic.modified_by = actor(user)
+        topic.modified_date = date.today()
+        db.commit()
+        return success({'topic_id': topic_id}, 'Topic updated')
+    except Exception:
+        db.rollback()
+        raise
+
+@router.post('/add_new_topic')
+def add_new_topic(request: NewTopicRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    try:
+        validate_context(db, request)
+        validate_instructor(db, request, request.instructor_id)
+        if not request.topic_title.strip() or not request.topic_code.strip():
+            raise HTTPException(422, 'Topic title and code are required')
+        if topic_query(db, request).filter_by(topic_code=request.topic_code.strip()).first():
+            raise HTTPException(409, 'Topic code already exists in this course')
+        topic = CudosTopic(crs_id=request.course_id, academic_batch_id=request.academic_batch_id,
+            semester_id=request.semester_id, topic_code=request.topic_code.strip(),
+            topic_title=request.topic_title.strip(), topic_content=request.topic_content,
+            topic_hrs=request.topic_hrs, num_of_sessions=request.num_of_sessions,
+            created_by=actor(user), created_date=date.today())
+        db.add(topic)
+        db.flush()
+        assignments = assign(db, AssignTopicsRequest(**request.model_dump(), assignments=[
+            TopicAssignment(topic_id=topic.topic_id, instructor_ids=[request.instructor_id])]), actor(user))
+        if request.delivery_date:
+            first = db.query(LMSMapPortionLS).filter_by(topic_id=topic.topic_id, section_id=request.section_id).order_by(LMSMapPortionLS.portion_id).first()
+            first.planned_date = request.delivery_date
+            first.delivery_date = request.delivery_date
+        db.commit()
+        return {'success': True, 'topic_id': topic.topic_id, 'mapping_id': assignments[0]['mapping_id']}
+    except Exception:
+        db.rollback()
+        raise
+
+@router.post('/topic_schedules')
+def topic_schedules(mapping_id: int = Body(..., embed=True), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    return success([serialize_portion(p, n) for n, p in enumerate(portions(db, get_mapping(db, mapping_id)), 1)])
+
+def write_portion(db, mapping, request, user_id, portion=None):
+    if bool(request.start_time) != bool(request.end_time):
+        raise HTTPException(422, 'Both delivery times are required')
+    if request.start_time and request.start_time >= request.end_time:
+        raise HTTPException(422, 'End time must be after start time')
+    if not portion:
+        portion = LMSMapPortionLS(topic_id=mapping.topic_id, section_id=mapping.section_id,
+            created_by=user_id, created_date=datetime.now())
+        db.add(portion)
+    portion.portion_ref = str(request.session_number)
+    portion.portion_per_hour = request.portion_to_be_covered
+    portion.planned_date = request.conduction_date
+    portion.delivery_date = request.actual_delivery_date
+    portion.start_time = request.start_time
+    portion.end_time = request.end_time
+    portion.status = int(bool(portion.delivery_date and portion.start_time))
+    portion.modified_by = user_id
+    portion.modified_date = datetime.now()
+    db.flush()
+    sync_calendar(db, mapping, portion, user_id)
+    return portion
+
+@router.post('/save_schedules')
+def save_schedules(request: SaveSchedulesRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    try:
+        mapping = get_mapping(db, request.mapping_id)
+        if request.instructor_ids is not None:
+            assign(db, AssignTopicsRequest(**context_for(mapping).model_dump(), assignments=[
+                TopicAssignment(topic_id=mapping.topic_id, instructor_ids=request.instructor_ids)]), actor(user))
+        existing = {p.portion_id: p for p in portions(db, mapping)}
+        ids = [s.schedule_id for s in request.schedules]
+        lectures = [s.session_number for s in request.schedules]
+        if len(ids) != len(set(ids)) or len(lectures) != len(set(lectures)):
+            raise HTTPException(422, 'Duplicate schedule or lecture number')
+        for s in request.schedules:
+            if s.schedule_id > 0 and s.schedule_id not in existing:
+                raise HTTPException(404, 'Schedule does not belong to this topic and section')
+            write_portion(db, mapping, s, actor(user), existing.get(s.schedule_id))
+        db.commit()
+        return success([serialize_portion(p, n) for n, p in enumerate(portions(db, mapping), 1)], 'Schedules saved')
+    except Exception:
+        db.rollback()
+        raise
+
+@router.post('/add_schedule')
+def add_schedule(request: AddScheduleRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    try:
+        p = write_portion(db, get_mapping(db, request.mapping_id), request, actor(user))
+        db.commit()
+        return {'success': True, 'schedule_id': p.portion_id}
+    except Exception:
+        db.rollback()
+        raise
+
+@router.put('/update_schedule/{schedule_id}')
+def update_schedule(schedule_id: int, request: dict = Body(...), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    try:
+        mapping = get_mapping(db, request.get('mapping_id'))
+        portion = db.query(LMSMapPortionLS).filter_by(portion_id=schedule_id,
+            topic_id=mapping.topic_id, section_id=mapping.section_id).first()
+        if not portion:
+            raise HTTPException(404, 'Schedule not found in this topic and section')
+        values = serialize_portion(portion, 1)
+        values.update(request)
+        write_portion(db, mapping, ScheduleInput(**values), actor(user), portion)
+        db.commit()
+        return success(message='Schedule updated')
+    except Exception:
+        db.rollback()
+        raise
+
+@router.post('/add_extra_class')
+def add_extra_class(request: ExtraClassRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    mapping = get_mapping(db, request.mapping_id)
+    next_number = max([int(p.portion_ref) for p in portions(db, mapping) if (p.portion_ref or '').isdigit()] or [0]) + 1
+    try:
+        portion = write_portion(db, mapping, AddScheduleRequest(mapping_id=request.mapping_id,
+            session_number=next_number, portion_to_be_covered=request.notes or 'Extra class',
+            conduction_date=request.class_date, start_time=request.start_time,
+            end_time=request.end_time), actor(user))
+        sync_calendar(db, mapping, portion, actor(user), extra=True)
+        db.commit()
+        return {'success': True, 'schedule_id': portion.portion_id}
+    except Exception:
+        db.rollback()
+        raise
+
+@router.post('/delivery_slots')
+def get_delivery_slots(mapping_id: int = Body(..., embed=True), db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    return success(delivery_slots(db, context_for(get_mapping(db, mapping_id))))
+
+@router.post('/bulk_delete_topics')
+def bulk_delete_topics(request: BulkDeleteRequest, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    try:
+        validate_context(db, request)
+        ids = set(request.topic_ids)
+        valid = {t.topic_id for t in topic_query(db, request).filter(CudosTopic.topic_id.in_(ids)).all()}
+        if valid != ids:
+            raise HTTPException(404, 'Topic not found in this academic context')
+        # Match the legacy removal: remove instructor assignments only. Keep
+        # section portions and delivered calendar/student history for reimport.
+        mapping_query(db, request).filter(LMSMapInstructorTopic.topic_id.in_(ids)).delete(synchronize_session=False)
+        db.commit()
+        return success(message='Topics removed from the selected section')
+    except Exception:
+        db.rollback()
+        raise
+
+@router.delete('/delete_topic/{topic_id}')
+def delete_topic(topic_id: int, request: TopicContext, db: Session = Depends(get_db), user: dict = Depends(get_current_user)):
+    return bulk_delete_topics(BulkDeleteRequest(**request.model_dump(), topic_ids=[topic_id]), db, user)

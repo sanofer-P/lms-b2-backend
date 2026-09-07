@@ -1,165 +1,120 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.core.database import get_db
-from .student_assignment_schema import *
-from datetime import datetime
-from fastapi.responses import FileResponse
+"""Assignment reports scoped to the selected batch, semester, course and section."""
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-import os
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.utils.auth_helper import get_current_user
+from .student_assignment_schema import AssignmentListRequest, StudentAssignmentReportRequest
+
+router = APIRouter(tags=["Student Assignment"], dependencies=[Depends(get_current_user)])
+
+# Use the upload mapping, as in CodeIgniter: an assignment need not have been
+# shared with a student yet to appear in the assignment dropdown.
+ASSIGNMENTS_SQL = """
+    SELECT a.lms_assignment_id AS value, a.assignment_name AS label
+    FROM lms_manage_assignment a
+    WHERE a.crs_id = :course_id AND a.semester_id = :semester_id
+      AND a.academic_batch_id = :academic_batch_id
+      AND EXISTS (
+        SELECT 1 FROM lms_map_assignment_upload upload
+        WHERE upload.lms_assignment_id = a.lms_assignment_id
+          AND upload.section_id = :section_id
+      )
+"""
 
 
-router = APIRouter(tags=["Student Assignment"])
+def parameters(data):
+    return data.model_dump() if hasattr(data, "model_dump") else data.dict()
 
 
-# ✅ 1. ASSIGNMENT DROPDOWN API
+def assignment_details(db, data):
+    assignment = db.execute(text(ASSIGNMENTS_SQL + " AND a.lms_assignment_id = :assignment_id"),
+                            parameters(data)).mappings().first()
+    if assignment is None:
+        raise HTTPException(404, "Assignment does not belong to the selected filters")
+    return assignment
+
+
+def report_rows(db, data):
+    # Current IEMS keeps the education-system switch on the course. Section IDs
+    # in assignment upload/topic APIs are CUDOS master-type IDs; students store
+    # section names. Course enrollment uses the parent section for a batch.
+    query = text("""
+        SELECT m.map_assignment_student_id AS id,
+               s.usno AS student_usn,
+               COALESCE(NULLIF(TRIM(CONCAT_WS(' ', NULLIF(s.first_name, ''),
+                   NULLIF(s.middle_name, ''), NULLIF(s.last_name, ''))), ''),
+                   NULLIF(TRIM(s.name), ''), s.usno) AS student_name,
+               m.secured_marks
+        FROM lms_map_assignment_to_students m
+        JOIN iems_students s ON s.student_id = m.ssd_id
+        JOIN iems_courses c ON c.crs_id = :course_id
+        JOIN cudos_master_type_details section ON section.mt_details_id = :section_id
+        WHERE m.lms_assignment_id = :assignment_id
+          AND (
+            (COALESCE(c.edu_sys_flag, 0) = 0
+             AND s.academic_batch_id = :academic_batch_id
+             AND s.section = section.mt_details_name)
+            OR (c.edu_sys_flag = 1 AND EXISTS (
+                SELECT 1 FROM cudos_map_courseto_student enrollment
+                WHERE enrollment.student_id = s.student_id
+                  AND enrollment.crs_id = :course_id
+                  AND enrollment.semester_id = :semester_id
+                  AND (enrollment.academic_batch_id = :academic_batch_id
+                       OR s.academic_batch_id = :academic_batch_id)
+                  AND enrollment.section_id = COALESCE(NULLIF(section.parent_id, 0), section.mt_details_id)
+            ))
+          )
+        ORDER BY s.usno, s.student_id, m.map_assignment_student_id
+    """)
+    return [dict(row) for row in db.execute(query, parameters(data)).mappings().all()]
+
+
 @router.post("/assignment_list")
 def get_assignment_list(data: AssignmentListRequest, db: Session = Depends(get_db)):
-    try:
-        print("Incoming Request:", data.dict())
-
-        query = text("""
-            SELECT DISTINCT 
-    m.lms_assignment_id,
-    a.assignment_name
-FROM lms_map_assignment_to_students m
-JOIN lms_manage_assignment a 
-    ON a.lms_assignment_id = m.lms_assignment_id
-WHERE a.crs_id = :course_id
-AND a.semester_id = :semester_id
-AND a.academic_batch_id = :academic_batch_id
-        """)
-
-        rows = db.execute(query, {
-            "course_id": data.course_id,
-            "semester_id": data.semester_id,
-            "academic_batch_id": data.academic_batch_id
-        }).mappings().all()
-
-        print("Assignments Fetched:", rows)
-
-        return {
-            "status": True,
-            "data": [
-                {
-                    "value": row["lms_assignment_id"],
-                    "label": row["assignment_name"]
-                }
-                for row in rows
-            ]
-        }
-
-    except Exception as e:
-        return {
-            "status": False,
-            "error": str(e)
-        }
+    rows = db.execute(text(ASSIGNMENTS_SQL + " ORDER BY a.lms_assignment_id"), parameters(data)).mappings().all()
+    return {"status": True, "data": [dict(row) for row in rows]}
 
 
-# ✅ 2. STUDENT REPORT API  — fixed: convert mappings to plain dicts
 @router.post("/report")
-def get_student_assignment_report(
-    data: StudentAssignmentReportRequest,
-    db: Session = Depends(get_db)
-):
-    try:
-        query = text("""
-SELECT 
-    m.student_usn,
-    CONCAT(
-        COALESCE(u.first_name, ''),
-        ' ',
-        COALESCE(u.middle_name, ''),
-        ' ',
-        COALESCE(u.last_name, '')
-    ) AS student_name,
-    m.secured_marks
-FROM lms_map_assignment_to_students m
-LEFT JOIN iems_students u 
-    ON u.usno = m.student_usn   -- ✅ FIXED HERE
-WHERE m.lms_assignment_id = :assignment_id
-""")
+def get_student_assignment_report(data: StudentAssignmentReportRequest, db: Session = Depends(get_db)):
+    assignment_details(db, data)
+    return {"status": True, "data": report_rows(db, data)}
 
-        result = db.execute(
-            query,
-            {"assignment_id": data.assignment_id}
-        ).mappings().all()
 
-        return {
-            "status": True,
-            "data": [dict(row) for row in result]
-        }
+def make_workbook(rows, assignment_name):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Assignment Report"
+    india = timezone(timedelta(hours=5, minutes=30))
+    ws.append(["Date of Export Report", datetime.now(india).strftime("%d-%m-%Y")])
+    ws.append(["Assignment Name", assignment_name])
+    ws.append(["USNO", "Student Name", "Marks"])
+    for row in rows:
+        ws.append([row["student_usn"], row["student_name"], row["secured_marks"]])
+    # Names and identifiers are literal strings, including values beginning '='.
+    for row in ws:
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+    for column, width in (("A", 24), ("B", 40), ("C", 12)):
+        ws.column_dimensions[column].width = width
+    stream = BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+    return stream
 
-    except Exception as e:
-        return {
-            "status": False,
-            "error": str(e)
-        }
 
-# ✅ 3. EXPORT EXCEL API
 @router.post("/export")
-def export_assignment_report(
-    data: StudentAssignmentReportRequest,
-    db: Session = Depends(get_db)
-):
-    try:
-        query = text("""
-SELECT 
-    m.student_usn,
-    CONCAT(
-        COALESCE(u.first_name, ''),
-        ' ',
-        COALESCE(u.middle_name, ''),
-        ' ',
-        COALESCE(u.last_name, '')
-    ) AS student_name,
-    m.secured_marks
-FROM lms_map_assignment_to_students m
-LEFT JOIN iems_students u 
-    ON u.usno = m.student_usn   -- ✅ FIXED HERE
-WHERE m.lms_assignment_id = :assignment_id
-""")
-        result = db.execute(
-            query,
-            {"assignment_id": data.assignment_id}
-        ).mappings().all()
-
-        if not result:
-            return {"status": False, "message": "No data found"}
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Assignment Report"
-
-        # ✅ Metadata
-        ws.append(["Date of Export Report", datetime.now().strftime("%d-%m-%Y")])
-        ws.append([])
-
-        # ✅ Header (NO remark)
-        ws.append(["Sl No", "Student USN", "Student Name", "Marks"])
-
-        # ✅ Data rows
-        for index, row in enumerate(result, start=1):
-            ws.append([
-                index,
-                row["student_usn"],
-                row["student_name"],
-                row["secured_marks"]
-            ])
-
-        file_name = f"assignment_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        file_path = f"./{file_name}"
-
-        wb.save(file_path)
-
-        return FileResponse(
-            path=file_path,
-            filename=file_name,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-    except Exception as e:
-        return {
-            "status": False,
-            "error": str(e)
-        }
+def export_assignment_report(data: StudentAssignmentReportRequest, db: Session = Depends(get_db)):
+    assignment = assignment_details(db, data)
+    stream = make_workbook(report_rows(db, data), assignment["label"])
+    return StreamingResponse(stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="assignment_report_{data.assignment_id}.xlsx"'})
