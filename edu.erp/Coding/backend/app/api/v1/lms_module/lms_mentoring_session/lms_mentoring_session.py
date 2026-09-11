@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Form, UploadFile, File
+from fastapi import APIRouter, Depends, Form, UploadFile, File, Query 
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -737,27 +737,134 @@ def update_mentoring_session(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
+    try:
+        user_id = current_user.get("user_id")
 
-    schedule = db.query(
-        LMSMentoringSchedule
-    ).filter(
-        LMSMentoringSchedule.schedule_id ==
-        schedule_id
-    ).first()
+        # --------------------------------------------------
+        # 1. Fetch and Validate Existing Schedule
+        # --------------------------------------------------
+        schedule = db.query(LMSMentoringSchedule).filter(
+            LMSMentoringSchedule.schedule_id == schedule_id
+        ).first()
 
-    if not schedule:
-        return returnException(
-            "Session not found"
-        )
+        if not schedule:
+            return returnException("Session not found")
 
-    schedule.session_agenda = req.session_agenda
-    schedule.modified_by = current_user["user_id"]
+        # --------------------------------------------------
+        # 2. Validate Group & Semester Mapping
+        # --------------------------------------------------
+        group = db.query(LMSMentorsGroup).filter(
+            LMSMentorsGroup.mentors_group_id == req.mentors_group_id
+        ).first()
 
-    db.commit()
+        if not group:
+            return returnException("Invalid mentoring group selected")
 
-    return returnSuccess(
-        "Session updated successfully"
-    )
+        group_term = db.query(LMSMentorsGroupTerms).filter(
+            LMSMentorsGroupTerms.mentors_group_id == req.mentors_group_id,
+            LMSMentorsGroupTerms.semester_id == req.semester_id
+        ).first()
+
+        if not group_term:
+            return returnException("Selected semester is not mapped to selected group")
+
+        # --------------------------------------------------
+        # 3. Fetch Allowed Group Mentees
+        # --------------------------------------------------
+        group_mentees = db.query(LMSGroupMentees.student_id).filter(
+            LMSGroupMentees.mentors_group_terms_id == group_term.mentors_group_terms_id
+        ).all()
+        allowed_students = {row.student_id for row in group_mentees}
+
+        # --------------------------------------------------
+        # 4. Update Core Schedule Fields
+        # --------------------------------------------------
+        schedule.session_agenda = req.session_agenda
+        schedule.questionnaire_id = group.questionnaire_id
+        schedule.mentors_group_terms_id = group_term.mentors_group_terms_id
+        schedule.modified_by = user_id
+        db.flush()
+
+        # --------------------------------------------------
+        # 5. Clear Out Existing Mappings (Teardown for Sync)
+        # --------------------------------------------------
+        # Fetch current sub-groups linked to this schedule to delete their dates safely
+        existing_subgroups = db.query(LMSMentoringSubGroup).filter(
+            LMSMentoringSubGroup.schedule_id == schedule_id
+        ).all()
+        existing_subgroup_ids = [sg.sub_group_id for sg in existing_subgroups]
+
+        if existing_subgroup_ids:
+            # Delete old mapped dates
+            db.query(LMSMentoringSubGrpDate).filter(
+                LMSMentoringSubGrpDate.sub_group_id.in_(existing_subgroup_ids)
+            ).delete(synchronize_session=False)
+
+        # Delete old mapped mentees
+        db.query(LMSMapMenteeSchedule).filter(
+            LMSMapMenteeSchedule.schedule_id == schedule_id
+        ).delete(synchronize_session=False)
+
+        # Delete old sub-groups
+        db.query(LMSMentoringSubGroup).filter(
+            LMSMentoringSubGroup.schedule_id == schedule_id
+        ).delete(synchronize_session=False)
+        db.flush()
+
+        # --------------------------------------------------
+        # 6. Re-create / Add Updated Sub-Groups, Dates, and Mentees
+        # --------------------------------------------------
+        for subgroup in req.sub_groups:
+            db_subgroup = LMSMentoringSubGroup(
+                schedule_id=schedule.schedule_id,
+                sub_group_name=subgroup.sub_group_name,
+                location=subgroup.location,
+                created_by=user_id,
+                modified_by=user_id
+            )
+            db.add(db_subgroup)
+            db.flush()
+
+            # Save Dates
+            for dt in subgroup.dates:
+                if dt.start_date > dt.end_date:
+                    db.rollback()
+                    return returnException("Start date cannot be greater than end date")
+                if dt.start_time >= dt.end_time:
+                    db.rollback()
+                    return returnException("Start time must be less than end time")
+
+                db_date = LMSMentoringSubGrpDate(
+                    sub_group_id=db_subgroup.sub_group_id,
+                    start_date=dt.start_date,
+                    end_date=dt.end_date,
+                    start_time=dt.start_time,
+                    end_time=dt.end_time,
+                    created_by=user_id
+                )
+                db.add(db_date)
+
+            # Save Mentees
+            for student_id in subgroup.mentee_ids:
+                if student_id not in allowed_students:
+                    db.rollback()
+                    return returnException(
+                        f"Student {student_id} is not part of the selected mentoring group"
+                    )
+
+                db_mentee = LMSMapMenteeSchedule(
+                    schedule_id=schedule.schedule_id,
+                    student_id=student_id,
+                    sub_group_id=db_subgroup.sub_group_id
+                )
+                db.add(db_mentee)
+
+        db.commit()
+        return returnSuccess("Session and sub-groups updated successfully")
+
+    except Exception as e:
+        db.rollback()
+        return returnException(str(e))
 
 @router.delete(
     "/delete_mentoring_session/{schedule_id}"
@@ -786,46 +893,55 @@ def delete_mentoring_session(
         "Session deleted successfully"
     )
 
-@router.get("/get_mentoring_session_mentees/{schedule_id}")
+@router.get("/sessions/{schedule_id}/mentees")
 def get_mentoring_session_mentees(
     schedule_id: int,
+    # 🌟 BACKEND FIX: Accept the sub_group_id query parameter
+    sub_group_id: int = Query(...), 
     db: Session = Depends(get_db)
 ):
     try:
-
-        data = (
+        # Join the Mapping table with Students table
+        query = (
             db.query(
                 LMSMapMenteeSchedule.student_id,
-                IEMStudents.regno,
-                IEMStudents.name,
+                IEMStudents.usno.label("student_usn"),  # Ensure column names match your DB
+                IEMStudents.name.label("student_name"),
+                IEMStudents.email.label("student_email"),
+                IEMStudents.mobile.label("contact_number"),
                 LMSMapMenteeSchedule.sub_group_id
             )
             .join(
                 IEMStudents,
-                IEMStudents.student_id ==
-                LMSMapMenteeSchedule.student_id
+                IEMStudents.student_id == LMSMapMenteeSchedule.student_id
             )
             .filter(
-                LMSMapMenteeSchedule.schedule_id ==
-                schedule_id
+                LMSMapMenteeSchedule.schedule_id == schedule_id,
+                # 🌟 Filter explicitly by the requested subgroup
+                LMSMapMenteeSchedule.sub_group_id == sub_group_id
             )
-            .all()
         )
+        
+        # Execute query
+        data = query.all()
 
-        result = []
-
-        for row in data:
-            result.append({
+        # Format results as clean JSON dictionaries for React
+        result = [
+            {
                 "student_id": row.student_id,
-                "regno": row.regno,
-                "student_name": row.name,
+                "student_usn": row.student_usn,
+                "student_name": row.student_name,
+                "student_email": row.student_email,
+                "contact_number": row.contact_number,
                 "sub_group_id": row.sub_group_id
-            })
+            }
+            for row in data
+        ]
 
         return returnSuccess(result)
 
     except Exception as e:
-        return returnException(str(e))
+        return returnException(f"Failed to fetch mentees: {str(e)}")
     
 @router.post("/get_mentee_questionnaire_response")
 def get_mentee_questionnaire_response(
@@ -1165,3 +1281,35 @@ def get_individual_comments(
     except Exception as e:
 
         return returnException(str(e))
+
+# ==========================================================
+# CHANGE STATUS ROUTE
+# ==========================================================
+@router.post("/change_status")
+def change_status(
+    sgd: int = Form(...),                  # Matches post parameter $this->input->post('sgd')
+    status: str = Form(...),               # Matches post parameter $this->input->post('status')
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user) # Included to guard authorization secure check
+):
+    try:
+        # 1. Prepare query criteria equivalent to $where
+        date_record = db.query(LMSMentoringSubGrpDate).filter(
+            LMSMentoringSubGrpDate.sub_group_date_id == sgd
+        ).first()
+
+        if not date_record:
+            return returnException("Sub-group date slot not found.")
+
+        # 2. Update status value
+        date_record.status = status
+        
+        # 3. Commit transaction to the database
+        db.commit()
+
+        # 4. Return success response format
+        return returnSuccess("Status updated successfully.")
+
+    except Exception as e:
+        db.rollback()
+        return returnException(f"Failed to update status, try again. Error: {str(e)}")

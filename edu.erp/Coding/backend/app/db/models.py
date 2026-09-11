@@ -118,7 +118,8 @@ class IEMSAcademicBatch(Base):
     end_year = Column(Integer, nullable=False)
     total_terms = Column(Integer, nullable=False)
     academic_batch_owner = Column(Integer, ForeignKey('iems_users.id'), nullable=False)
-
+    first_year_flag = Column(TINYINT, default=0)
+    
     cia_passing_marks = Column(Float, default=0)
     tee_passing_marks = Column(Float, default=0)
 
@@ -6727,7 +6728,7 @@ class LMSCrossDeptMentor(Base):
 
     curriculum_id = Column(
         Integer,
-        ForeignKey("erp_curriculum.erp_crclm_id"),
+        ForeignKey("iems_academic_batch.academic_batch_id"),
         nullable=True
     )
 

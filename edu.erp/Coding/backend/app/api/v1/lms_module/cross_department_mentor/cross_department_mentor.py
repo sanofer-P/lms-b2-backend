@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db, engine
-from app.db.models import Base, IEMSDepartment, IEMSUsers, LMSCrossDeptMentor, ErpCurriculum
+from app.db.models import Base, IEMSAcademicBatch, IEMSDepartment, IEMSUsers, LMSCrossDeptMentor, ErpCurriculum
 from app.utils.auth_helper import get_current_user
 from app.utils.http_return_helper import returnException, returnSuccess
 
@@ -27,30 +27,99 @@ print("CROSS DEPARTMENT MENTOR LOADED")
 # Helper: resolve a user's full name from IEMSUsers
 # ---------------------------------------------------------------------------
 
-def _build_mentor_row(record: LMSCrossDeptMentor, db: Session) -> dict:
-    """Return a dict representation of one cross-dept assignment row."""
-    mentor_user = db.query(IEMSUsers).filter(IEMSUsers.id == record.mentor_user_id).first()
-    mentor_dept = db.query(IEMSDepartment).filter(IEMSDepartment.dept_id == record.mentor_dept_id).first()
-    assigned_dept = db.query(IEMSDepartment).filter(IEMSDepartment.dept_id == record.assigned_dept_id).first()
+def _build_mentor_row(
+    record: LMSCrossDeptMentor,
+    db: Session,
+    curriculum_records=None,
+) -> dict:
 
-    curriculum = None
-    if getattr(record, "curriculum_id", None):
-        curriculum = db.query(ErpCurriculum).filter(ErpCurriculum.erp_crclm_id == record.curriculum_id).first()
+    mentor_user = db.query(IEMSUsers).filter(
+        IEMSUsers.id == record.mentor_user_id
+    ).first()
+
+    mentor_dept = db.query(IEMSDepartment).filter(
+        IEMSDepartment.dept_id == record.mentor_dept_id
+    ).first()
+
+    assigned_dept = db.query(IEMSDepartment).filter(
+        IEMSDepartment.dept_id == record.assigned_dept_id
+    ).first()
+
+    # -----------------------------------------
+    # If curriculum_records not supplied,
+    # use current record
+    # -----------------------------------------
+    if curriculum_records is None:
+        curriculum_records = [record]
+
+    curriculum_ids = []
+    curriculum_names = []
+
+    for item in curriculum_records:
+
+        if not item.curriculum_id:
+            continue
+
+        curriculum = (
+            db.query(IEMSAcademicBatch)
+            .filter(
+                IEMSAcademicBatch.academic_batch_id
+                == item.curriculum_id
+            )
+            .first()
+        )
+
+        if curriculum:
+            curriculum_ids.append(item.curriculum_id)
+            curriculum_names.append(
+                curriculum.academic_batch_code
+            )
 
     return {
         "id": record.id,
+
         "mentor_user_id": record.mentor_user_id,
+
         "mentor_name": (
-            f"{mentor_user.first_name or ''} {mentor_user.last_name or ''}".strip()
-            if mentor_user else "Unknown"
+            f"{mentor_user.first_name or ''} "
+            f"{mentor_user.last_name or ''}".strip()
+            if mentor_user
+            else "Unknown"
         ),
-        "mentor_email": mentor_user.email if mentor_user else None,
+
+        "mentor_email": (
+            mentor_user.email
+            if mentor_user
+            else None
+        ),
+
         "mentor_dept_id": record.mentor_dept_id,
-        "mentor_dept_name": mentor_dept.dept_name if mentor_dept else None,
+
+        "mentor_dept_name": (
+            mentor_dept.dept_name
+            if mentor_dept
+            else None
+        ),
+
         "assigned_dept_id": record.assigned_dept_id,
-        "assigned_dept_name": assigned_dept.dept_name if assigned_dept else None,
-        "curriculum_id": record.curriculum_id if getattr(record, "curriculum_id", None) else None,
-        "curriculum_name": curriculum.erp_crclm_name if curriculum else None,
+
+        "assigned_dept_name": (
+            assigned_dept.dept_name
+            if assigned_dept
+            else None
+        ),
+
+        "curriculum_ids": curriculum_ids,
+
+        "curriculum_id": (
+            curriculum_ids[0]
+            if curriculum_ids
+            else None
+        ),
+
+        "curriculum_name": ", ".join(
+            curriculum_names
+        ) if curriculum_names else None,
     }
 
 
@@ -136,15 +205,15 @@ def list_curriculums(
     Returns all active curriculums.
     """
     curriculums = (
-        db.query(ErpCurriculum)
-        .filter(ErpCurriculum.status == 1)
-        .order_by(ErpCurriculum.erp_crclm_name)
+        db.query(IEMSAcademicBatch)
+        .filter(IEMSAcademicBatch.status == 1)
+        .order_by(IEMSAcademicBatch.academic_batch_code)
         .all()
     )
     data = [
         {
-            "crclm_id": c.erp_crclm_id,
-            "crclm_name": c.erp_crclm_name,
+            "crclm_id": c.academic_batch_id,
+            "crclm_name": c.academic_batch_code,
         }
         for c in curriculums
     ]
@@ -193,7 +262,36 @@ def list_mentors_from_other_dept(
         query = query.filter(LMSCrossDeptMentor.mentor_dept_id == filter_dept_id)
 
     records = query.order_by(LMSCrossDeptMentor.id).all()
-    data = [_build_mentor_row(r, db) for r in records]
+
+    grouped = {}
+
+    for record in records:
+
+        key = (
+            record.mentor_user_id,
+            record.mentor_dept_id,
+            record.assigned_dept_id,
+        )
+
+        if key not in grouped:
+            grouped[key] = []
+
+        grouped[key].append(record)
+
+    data = []
+
+    for key, group_records in grouped.items():
+
+        first_record = group_records[0]
+
+        data.append(
+            _build_mentor_row(
+                first_record,
+                db,
+                group_records
+            )
+        )
+
     return returnSuccess(data)
 
 
@@ -257,76 +355,147 @@ def save_cross_dept_mentor(
     db: Session = Depends(get_db),
 ):
     """
-    Assigns `mentor_user_id` (from `mentor_dept_id`) as a cross-dept mentor
-    to the logged-in faculty's department (`dept_id` header).
-
-    Validations:
-    - Mentor's home dept must NOT be the same as the target dept.
-    - No duplicate active assignment for the same mentor → same target dept.
-    - The mentor user must exist and be active.
+    Adds a cross-department mentor with one or more curriculums.
     """
+
+    # -----------------------------------------
+    # Get department
+    # -----------------------------------------
     if not dept_id:
-        user_record = db.query(IEMSUsers).filter(IEMSUsers.id == current_user.get("user_id")).first()
+        user_record = db.query(IEMSUsers).filter(
+            IEMSUsers.id == current_user.get("user_id")
+        ).first()
+
         dept_id = user_record.user_dept_id if user_record else None
 
     if not dept_id:
-        first_dept = db.query(IEMSDepartment).filter(IEMSDepartment.status == 1).order_by(IEMSDepartment.dept_id).first()
+        first_dept = (
+            db.query(IEMSDepartment)
+            .filter(IEMSDepartment.status == 1)
+            .order_by(IEMSDepartment.dept_id)
+            .first()
+        )
+
         dept_id = first_dept.dept_id if first_dept else None
 
     if not dept_id:
-        return returnException("Department ID is required but could not be determined.")
+        return returnException(
+            "Department ID is required but could not be determined."
+        )
 
     user_id = current_user.get("user_id")
 
-    # Guard: mentor must be from a different department
+    # -----------------------------------------
+    # Mentor cannot belong to same department
+    # -----------------------------------------
     if payload.mentor_dept_id == dept_id:
         return returnException(
-            "The mentor belongs to the same department. Cross-department assignment requires a different department."
+            "The mentor belongs to the same department. "
+            "Cross-department assignment requires a different department."
         )
 
-    # Guard: mentor user must exist and be active
-    mentor_user = db.query(IEMSUsers).filter(
-        IEMSUsers.id == payload.mentor_user_id,
-        IEMSUsers.status == 1,
-    ).first()
-    if not mentor_user:
-        return returnException("Mentor user not found or inactive.")
-
-    # Guard: no duplicate active assignment
-    duplicate = db.query(LMSCrossDeptMentor).filter(
-        LMSCrossDeptMentor.mentor_user_id == payload.mentor_user_id,
-        LMSCrossDeptMentor.assigned_dept_id == dept_id,
-        LMSCrossDeptMentor.org_id == org_id,
-        LMSCrossDeptMentor.status == 1,
-    ).first()
-    if duplicate:
-        return returnException(
-            "This mentor is already assigned to your department."
+    # -----------------------------------------
+    # Mentor must exist and be active
+    # -----------------------------------------
+    mentor_user = (
+        db.query(IEMSUsers)
+        .filter(
+            IEMSUsers.id == payload.mentor_user_id,
+            IEMSUsers.status == 1,
         )
-
-    new_record = LMSCrossDeptMentor(
-        mentor_user_id=payload.mentor_user_id,
-        mentor_dept_id=payload.mentor_dept_id,
-        assigned_dept_id=dept_id,
-        curriculum_id=payload.curriculum_id,
-        org_id=org_id,
-        status=1,
-        created_by=user_id,
-        create_date=datetime.now(),
+        .first()
     )
-    db.add(new_record)
+
+    if not mentor_user:
+        return returnException(
+            "Mentor user not found or inactive."
+        )
+
+    # -----------------------------------------
+    # Curriculum is required
+    # -----------------------------------------
+    if not payload.curriculum_ids:
+        return returnException(
+            "At least one curriculum is required."
+        )
+
+    # Remove duplicate curriculum IDs from request
+    curriculum_ids = list(set(payload.curriculum_ids))
+
+    # -----------------------------------------
+    # Find already existing curriculum mappings
+    # -----------------------------------------
+    existing_records = (
+        db.query(LMSCrossDeptMentor)
+        .filter(
+            LMSCrossDeptMentor.mentor_user_id == payload.mentor_user_id,
+            LMSCrossDeptMentor.mentor_dept_id == payload.mentor_dept_id,
+            LMSCrossDeptMentor.assigned_dept_id == dept_id,
+            LMSCrossDeptMentor.org_id == org_id,
+            LMSCrossDeptMentor.status == 1,
+            LMSCrossDeptMentor.curriculum_id.in_(curriculum_ids),
+        )
+        .all()
+    )
+
+    existing_curriculum_ids = {
+        record.curriculum_id
+        for record in existing_records
+    }
+
+    # -----------------------------------------
+    # Create only missing curriculum mappings
+    # -----------------------------------------
+    new_records = []
+
+    for curriculum_id in curriculum_ids:
+
+        if curriculum_id in existing_curriculum_ids:
+            continue
+
+        new_record = LMSCrossDeptMentor(
+            mentor_user_id=payload.mentor_user_id,
+            mentor_dept_id=payload.mentor_dept_id,
+            assigned_dept_id=dept_id,
+            curriculum_id=curriculum_id,
+            org_id=org_id,
+            status=1,
+            created_by=user_id,
+            create_date=datetime.now(),
+        )
+
+        db.add(new_record)
+        new_records.append(new_record)
+
+    # -----------------------------------------
+    # Nothing new was added
+    # -----------------------------------------
+    if not new_records:
+        return returnException(
+            "All selected curriculums are already assigned to this mentor."
+        )
+
     db.commit()
-    db.refresh(new_record)
+
+    for record in new_records:
+        db.refresh(record)
 
     return returnSuccess(
-        _build_mentor_row(new_record, db),
+        {
+            "mentor_user_id": payload.mentor_user_id,
+            "mentor_dept_id": payload.mentor_dept_id,
+            "curriculum_ids": [
+                record.curriculum_id
+                for record in new_records
+            ],
+        },
         "Cross-department mentor added successfully.",
     )
 
 
 # ---------------------------------------------------------------------------
 # PUT /update/{id} – re-target an assignment to a different department
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------  
 
 @router.put("/update/{id}")
 def update_cross_dept_mentor(
@@ -395,22 +564,55 @@ def delete_cross_dept_mentor(
     db: Session = Depends(get_db),
 ):
     """
-    Soft-deletes (status=0) a cross-department mentor assignment.
-    Only assignments visible within the caller's org are deletable.
+    Soft-deletes all cross-department mentor assignments
+    for the selected mentor_dept_id and curriculum_id.
     """
-    user_id = current_user.get("user_id")
 
+    user_id = current_user.get("user_id")
+    current_datetime = datetime.now()
+
+    # First find the selected record
     record = db.query(LMSCrossDeptMentor).filter(
         LMSCrossDeptMentor.id == id,
         LMSCrossDeptMentor.org_id == org_id,
         LMSCrossDeptMentor.status == 1,
     ).first()
-    if not record:
-        return returnException("Cross-department mentor assignment not found.")
 
-    record.status = 0
-    record.modified_by = user_id
-    record.modify_date = datetime.now()
+    if not record:
+        return returnException(
+            "Cross-department mentor assignment not found."
+        )
+
+    # Get the grouping values from the selected record
+    mentor_dept_id = record.mentor_dept_id
+    curriculum_id = record.curriculum_id
+    mentor_user_id = record.mentor_user_id
+
+    # Delete all related curriculum records
+    deleted_count = db.query(LMSCrossDeptMentor).filter(
+        LMSCrossDeptMentor.mentor_dept_id == mentor_dept_id,
+        # LMSCrossDeptMentor.curriculum_id == curriculum_id,
+        LMSCrossDeptMentor.mentor_user_id == mentor_user_id,
+        LMSCrossDeptMentor.org_id == org_id,
+        LMSCrossDeptMentor.status == 1,
+    ).update(
+        {
+            LMSCrossDeptMentor.status: 0,
+            LMSCrossDeptMentor.modified_by: user_id,
+            LMSCrossDeptMentor.modify_date: current_datetime,
+        },
+        synchronize_session=False
+    )
+
     db.commit()
 
-    return returnSuccess({"id": id}, "Cross-department mentor removed successfully.")
+    return returnSuccess(
+        {
+            "id": id,
+            "mentor_dept_id": mentor_dept_id,
+            "curriculum_id": curriculum_id,
+            "mentor_user_id": mentor_user_id,
+            "deleted_count": deleted_count,
+        },
+        "Cross-department mentor and related curriculum removed successfully."
+    )

@@ -1,4 +1,6 @@
 from datetime import datetime
+from itertools import groupby
+from operator import itemgetter
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -13,6 +15,7 @@ from app.utils.http_return_helper import (
 )
 
 from app.db.models import (
+    CudosMapCoursetoStudent,
     LMSIssuesObservations,
     LMSIssuesObservationsHistory,
     IEMStudents,
@@ -480,4 +483,65 @@ def get_student_issue_observation_history(
 
     except Exception as e:
 
+        return returnException(str(e))
+
+@router.get("/get_crclm_term/{student_usn}")
+def get_curriculum_terms_by_usn(
+    student_usn: str,
+    db: Session = Depends(get_db)
+):
+    try:
+        # 1. Exact raw SQL logic from your PHP code
+        sql_query = text("""
+            SELECT
+                ssd.ssd_id, 
+                ssd.student_usn, 
+                mcs.crclm_term_id, 
+                ct.term_name, 
+                crclm.crclm_id, 
+                crclm.crclm_name,
+                GROUP_CONCAT(DISTINCT(c.crs_code)) AS crs_code
+            FROM su_student_stakeholder_details as ssd 
+            JOIN map_courseto_student as mcs ON mcs.student_id = ssd.ssd_id
+            JOIN crclm_terms as ct ON ct.crclm_term_id = mcs.crclm_term_id AND ct.crclm_id = mcs.crclm_id
+            JOIN curriculum as crclm ON crclm.crclm_id = mcs.crclm_id
+            JOIN course as c ON c.crs_id = mcs.crs_id
+            WHERE ssd.student_usn = :usn
+            GROUP BY mcs.crclm_term_id
+            ORDER BY crclm.crclm_id, crclm.first_year_flag DESC, ct.term_name
+        """)
+        
+        results = db.execute(sql_query, {"usn": student_usn}).fetchall()
+
+        # 2. Exact grouping logic from PHP (grouping terms under their curriculum)
+        grouped_data = []
+        current_crclm_name = ""
+        current_group = None
+
+        for row in results:
+            if row.crclm_name != current_crclm_name:
+                if current_group is not None:
+                    grouped_data.append(current_group)
+                
+                current_crclm_name = row.crclm_name
+                # Mapping crclm_id to academic_batch_id so your existing React type definition works
+                current_group = {
+                    "academic_batch_id": row.crclm_id, 
+                    "curriculum_name": row.crclm_name,
+                    "terms": []
+                }
+            
+            # Append term to the current optgroup/curriculum
+            current_group["terms"].append({
+                "term_id": row.crclm_term_id,
+                "term_name": row.term_name
+            })
+
+        # Append the final group
+        if current_group is not None:
+            grouped_data.append(current_group)
+
+        return returnSuccess(grouped_data)
+
+    except Exception as e:
         return returnException(str(e))

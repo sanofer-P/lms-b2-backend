@@ -32,7 +32,8 @@ from app.db.models import (
 from .lms_mentors_group_schema import (
     MentorsGroupCreate,
     MentorMapRequest,
-    MenteeMapRequest
+    MenteeMapRequest,
+    MentorsGroupTitleUpdate
 )
 
 router = APIRouter()
@@ -122,48 +123,62 @@ def save_mentors_group(
         mentors_group.mentors_group_id
     })
 
+@router.put("/update_mentors_group_title/{mentors_group_id}")
+def update_mentors_group_title(
+    mentors_group_id: int,
+    mentors_group_data: MentorsGroupTitleUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_id = current_user.get("user_id")
+
+    # Find the existing group
+    mentors_group = db.query(LMSMentorsGroup).filter(
+        LMSMentorsGroup.mentors_group_id == mentors_group_id
+    ).first()
+
+    if not mentors_group:
+        return returnException("Mentors Group not found")
+
+    # Update only the title and modification details
+    mentors_group.mentors_pgm_title = mentors_group_data.mentors_pgm_title
+    mentors_group.modified_by = user_id
+    mentors_group.modified_date = datetime.now()
+
+    db.commit()
+    db.refresh(mentors_group)
+
+    return returnSuccess({
+        "message": "Group title updated successfully",
+        "mentors_group_id": mentors_group.mentors_group_id
+    })
 
 @router.get("/get_mentors_group_list")
 def get_mentors_group_list(
+    academic_batch_id: int = None,  # <-- Added query parameter filter
     db: Session = Depends(get_db)
 ):
-
-    data = db.query(
-        LMSMentorsGroup
-    ).order_by(
-        LMSMentorsGroup.mentors_group_id.desc()
-    ).all()
-
+    query = db.query(LMSMentorsGroup)
+    
+    # Filter by academic_batch_id if provided by the frontend
+    if academic_batch_id is not None:
+        query = query.filter(LMSMentorsGroup.academic_batch_id == academic_batch_id)
+        
+    data = query.order_by(LMSMentorsGroup.mentors_group_id.desc()).all()
+    
     result = []
-
     for row in data:
-
-        term_count = db.query(
-            LMSMentorsGroupTerms
-        ).filter(
-            LMSMentorsGroupTerms.mentors_group_id ==
-            row.mentors_group_id
+        term_count = db.query(LMSMentorsGroupTerms).filter(
+            LMSMentorsGroupTerms.mentors_group_id == row.mentors_group_id
         ).count()
 
         result.append({
-
-            "mentors_group_id":
-            row.mentors_group_id,
-
-            "academic_batch_id":
-            row.academic_batch_id,
-
-            "config_type_id":
-            row.config_type_id,
-
-            "questionnaire_id":
-            row.questionnaire_id,
-
-            "mentors_pgm_title":
-            row.mentors_pgm_title,
-
-            "term_count":
-            term_count
+            "mentors_group_id": row.mentors_group_id,
+            "academic_batch_id": row.academic_batch_id,
+            "config_type_id": row.config_type_id,
+            "questionnaire_id": row.questionnaire_id,
+            "mentors_pgm_title": row.mentors_pgm_title,
+            "term_count": term_count
         })
 
     return returnSuccess(result)
@@ -276,17 +291,30 @@ def get_group_complete(
         ]
     })
 
-
-@router.delete(
-    "/delete_mentors_group/{mentors_group_id}"
-)
+@router.delete("/delete_mentors_group/{mentors_group_id}")
 def delete_mentors_group(
-    mentors_group_id: int
+    mentors_group_id: int,
+    db: Session = Depends(get_db)  # ADDED: Database session dependency
 ):
+    try:
+        # 1. Fetch the target group from the database
+        mentors_group = db.query(LMSMentorsGroup).filter(
+            LMSMentorsGroup.mentors_group_id == mentors_group_id
+        ).first()
 
-    return returnException(
-        "Group deletion not allowed"
-    )
+        # 2. Check if the group actually exists
+        if not mentors_group:
+            return returnException("Mentors Group not found")
+
+        # 3. Delete the group (cascade rules on the database level will clean up mapped items)
+        db.delete(mentors_group)
+        db.commit()
+
+        return returnSuccess("Mentoring group deleted successfully.")
+
+    except Exception as e:
+        db.rollback()
+        return returnException(f"Something went wrong please try again. Error: {str(e)}")
 
 @router.post("/map_mentors")
 def map_mentors(
@@ -445,131 +473,69 @@ def delete_mentor(
         "Mentor deleted successfully"
     )
 
-# @router.post("/map_mentees")
-# def map_mentees(
-#     request: MenteeMapRequest,
-#     current_user: dict = Depends(get_current_user),
-#     db: Session = Depends(get_db)
-# ):
-
-#     user_id = current_user.get("user_id")
-
-#     records_created = 0
-
-#     for mentor_id in request.mentor_ids:
-
-#         mentor_rows = db.query(
-#             LMSGroupMentors
-#         ).filter(
-#             LMSGroupMentors.mentor_id == mentor_id
-#         ).all()
-
-#         if not mentor_rows:
-#             continue
-
-#         for mentor_row in mentor_rows:
-
-#             for mentee_id in request.mentee_ids:
-
-#                 exists = db.query(
-#                     LMSGroupMentees
-#                 ).filter(
-#                     LMSGroupMentees.group_mentor_id ==
-#                     mentor_row.group_mentor_id,
-
-#                     LMSGroupMentees.student_id ==
-#                     mentee_id
-#                 ).first()
-
-#                 if exists:
-#                     continue
-
-#                 mentee = LMSGroupMentees(
-
-#                     mentors_group_terms_id=
-#                     mentor_row.mentors_group_terms_id,
-
-#                     group_mentor_id=
-#                     mentor_row.group_mentor_id,
-
-#                     student_id=
-#                     mentee_id,
-
-#                     created_by=
-#                     user_id,
-
-#                     created_date=
-#                     datetime.now()
-#                 )
-
-#                 db.add(mentee)
-
-#                 records_created += 1
-
-#     db.commit()
-
-#     return returnSuccess({
-#         "records_created": records_created
-#     })
-
 @router.post("/map_mentees")
 def map_mentees(
     request: MenteeMapRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
     user_id = current_user.get("user_id")
-
-    # 1. Get all mentor rows in one go
-    mentor_rows = db.query(LMSGroupMentors).filter(
-        LMSGroupMentors.mentor_id.in_(request.mentor_ids)
-    ).all()
-
-    if not mentor_rows:
-        return returnException("No mentors found for given mentor_ids")
-
     records_created = 0
 
-    # 2. Preload existing mentee mappings (avoid repeated queries)
-    existing = db.query(LMSGroupMentees).filter(
-        LMSGroupMentees.group_mentor_id.in_(
-            [m.group_mentor_id for m in mentor_rows]
-        ),
-        LMSGroupMentees.student_id.in_(request.mentee_ids)
-    ).all()
+    try:
+        # 1. Find the specific "group-term" link for the provided group
+        group_terms = db.query(LMSMentorsGroupTerms).filter(
+            LMSMentorsGroupTerms.mentors_group_id == request.mentors_group_id
+        ).all()
 
-    existing_set = {
-        (e.group_mentor_id, e.student_id)
-        for e in existing
-    }
+        if not group_terms:
+            return returnException("No applicable terms found for this mentoring group.")
 
-    # 3. Insert new mappings
-    for mentor_row in mentor_rows:
+        # Create a dictionary for quick lookup
+        term_map = {term.mentors_group_terms_id: term for term in group_terms}
 
-        for mentee_id in request.mentee_ids:
+        # 2. Get the specific "group-mentor" link for each mentor within those terms
+        group_mentor_rows = db.query(LMSGroupMentors).filter(
+            LMSGroupMentors.mentors_group_terms_id.in_(term_map.keys()),
+            LMSGroupMentors.mentor_id.in_(request.mentor_ids)
+        ).all()
 
-            key = (mentor_row.group_mentor_id, mentee_id)
+        if not group_mentor_rows:
+            return returnException("None of the selected mentors are mapped to the terms of this group.")
 
-            if key in existing_set:
-                continue
+        # 3. For each of those mentor-term links, map the new mentees
+        for group_mentor in group_mentor_rows:
+            for mentee_id in request.mentee_ids:
+                # Check if this exact mentee is already mapped to this specific mentor link
+                exists = db.query(LMSGroupMentees).filter(
+                    LMSGroupMentees.group_mentor_id == group_mentor.group_mentor_id,
+                    LMSGroupMentees.student_id == mentee_id
+                ).first()
 
-            mentee = LMSGroupMentees(
-                mentors_group_terms_id=mentor_row.mentors_group_terms_id,
-                group_mentor_id=mentor_row.group_mentor_id,
-                student_id=mentee_id,
-                created_by=user_id,
-                created_date=datetime.now()
-            )
+                if exists:
+                    continue  # Skip if already mapped
 
-            db.add(mentee)
-            records_created += 1
+                # Create the new mentee mapping
+                new_mentee_map = LMSGroupMentees(
+                    mentors_group_terms_id=group_mentor.mentors_group_terms_id,
+                    group_mentor_id=group_mentor.group_mentor_id,
+                    student_id=mentee_id,
+                    created_by=user_id,
+                    created_date=datetime.now()
+                )
+                db.add(new_mentee_map)
+                records_created += 1
+        
+        db.commit()
 
-    db.commit()
+        return returnSuccess({
+            "message": f"Successfully created {records_created} new mentee mappings.",
+            "records_created": records_created
+        })
 
-    return returnSuccess({
-        "records_created": records_created
-    })
+    except Exception as e:
+        db.rollback()
+        return returnException(str(e))
 
 @router.get(
     "/get_group_mentees/{mentors_group_id}"
@@ -944,7 +910,7 @@ def get_academic_batch_list(
     return returnSuccess(result)
 
 @router.get(
-    "/get_semesters_by_academic_batch/{academic_batch_id}"
+    "/get_semesters_by_academic_batch"
 )
 def get_semesters_by_academic_batch(
     academic_batch_id: int,
@@ -1005,7 +971,7 @@ def get_semesters_by_academic_batch(
 
     return returnSuccess(result)
 
-@router.get("/get_all_mentors/{academic_batch_id}")
+@router.get("/get_all_mentors")
 def get_all_mentors(
     academic_batch_id: int,
     db: Session = Depends(get_db)
