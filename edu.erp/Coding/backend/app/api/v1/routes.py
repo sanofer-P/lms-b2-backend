@@ -673,3 +673,10 @@ router.include_router(my_class_router, prefix="/my-class", tags=["My Class"])
 
 from app.api.v1.lms_module.quiz_report import router as quiz_report_router
 router.include_router(quiz_report_router, prefix="/quiz-report", tags=["Student Quiz Report"])
+
+
+router.include_router(
+    issues_observations_report_router,
+    prefix="/lms_issues_observations_report",
+    tags=["Issues and Observations Report"]
+)

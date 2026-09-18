@@ -4,6 +4,7 @@ from operator import itemgetter
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.core.database import get_db
 
@@ -16,6 +17,7 @@ from app.utils.http_return_helper import (
 
 from app.db.models import (
     CudosMapCoursetoStudent,
+    IEMSCourses,
     LMSIssuesObservations,
     LMSIssuesObservationsHistory,
     IEMStudents,
@@ -29,6 +31,42 @@ from app.db.models import (
 from .lms_stud_issues_observations_report_schema import *
 
 router = APIRouter()
+
+# ==========================================================
+# GET STUDENT DETAILS BY USN
+# ==========================================================
+@router.get("/get_student_by_usn/{student_usn}")
+def get_student_by_usn(
+    student_usn: str,
+    db: Session = Depends(get_db)
+):
+    try:
+        # Find the student in the database using their USN.
+        # Note: Adjust 'IEMStudents' and 'student_usn' to match your actual model and column name.
+        student = db.query(IEMStudents).filter(
+            IEMStudents.student_usn == student_usn
+        ).first()
+
+        if not student:
+            # If no student is found, return an error.
+            return returnException(f"Student with USN '{student_usn}' not found.", 404)
+
+        # The frontend expects data in a specific format.
+        # Create a dictionary that matches the 'IssueObservationStudent' type in your React code.
+        result = {
+            "student_id": student.student_id,  # Or student.id, student.ssd_id etc.
+            "student_name": student.student_name,
+            "student_usn": student.student_usn,
+            "academic_batch_id": student.academic_batch_id,
+            "semester_id": student.semester_id,
+            "email": student.email,
+            "mobile": student.mobile,
+        }
+
+        return returnSuccess(result)
+
+    except Exception as e:
+        return returnException(str(e))
 
 # ==========================================================
 # GET STUDENT ISSUE & OBSERVATION REPORTS
@@ -485,63 +523,82 @@ def get_student_issue_observation_history(
 
         return returnException(str(e))
 
-@router.get("/get_crclm_term/{student_usn}")
-def get_curriculum_terms_by_usn(
+# =================================================================
+# GET CURRICULUM TERMS BY USN (Pure Query & Grouping Logic)
+# =================================================================
+@router.get("/get_crclm_term/{student_usn}", response_model=List[CurriculumGroup])
+def get_term_details_by_usn(
     student_usn: str,
     db: Session = Depends(get_db)
 ):
+    """
+    This endpoint fetches term and curriculum details for a given student,
+    using the correct SQLAlchemy models as defined in models.py.
+    """
     try:
-        # 1. Exact raw SQL logic from your PHP code
-        sql_query = text("""
-            SELECT
-                ssd.ssd_id, 
-                ssd.student_usn, 
-                mcs.crclm_term_id, 
-                ct.term_name, 
-                crclm.crclm_id, 
-                crclm.crclm_name,
-                GROUP_CONCAT(DISTINCT(c.crs_code)) AS crs_code
-            FROM su_student_stakeholder_details as ssd 
-            JOIN map_courseto_student as mcs ON mcs.student_id = ssd.ssd_id
-            JOIN crclm_terms as ct ON ct.crclm_term_id = mcs.crclm_term_id AND ct.crclm_id = mcs.crclm_id
-            JOIN curriculum as crclm ON crclm.crclm_id = mcs.crclm_id
-            JOIN course as c ON c.crs_id = mcs.crs_id
-            WHERE ssd.student_usn = :usn
-            GROUP BY mcs.crclm_term_id
-            ORDER BY crclm.crclm_id, crclm.first_year_flag DESC, ct.term_name
-        """)
-        
-        results = db.execute(sql_query, {"usn": student_usn}).fetchall()
+        # --- SQLAlchemy ORM Query ---
+        # This query directly translates your raw SQL into a type-safe ORM query.
+        query_results = (
+            db.query(
+                IEMSAcademicBatch.academic_batch_id,
+                IEMSAcademicBatch.academic_batch_code,
+                IEMSemester.semester_id,
+                IEMSemester.semester_code
+            )
+            .select_from(IEMStudents)
+            # 1. JOIN map_courseto_student
+            .join(
+                CudosMapCoursetoStudent,
+                CudosMapCoursetoStudent.student_id == IEMStudents.student_id
+            )
+            # 2. JOIN crclm_terms
+            .join(
+                IEMSemester,
+                (IEMSemester.semester_id == CudosMapCoursetoStudent.semester_id) &
+                (IEMSemester.academic_batch_id == CudosMapCoursetoStudent.academic_batch_id)
+            )
+            # 3. JOIN curriculum
+            .join(
+                IEMSAcademicBatch,
+                IEMSAcademicBatch.academic_batch_id == CudosMapCoursetoStudent.academic_batch_id
+            )
+            .join(
+                IEMSCourses,
+                IEMSCourses.crs_id == CudosMapCoursetoStudent.crs_id
+            )
+            # WHERE clause
+            .filter(IEMStudents.usno == student_usn)
+            # ORDER BY for correct grouping
+            .order_by(IEMSAcademicBatch.academic_batch_id)
+            .all()
+        )
 
-        # 2. Exact grouping logic from PHP (grouping terms under their curriculum)
-        grouped_data = []
-        current_crclm_name = ""
-        current_group = None
+        if not query_results:
+            return returnSuccess([])
 
-        for row in results:
-            if row.crclm_name != current_crclm_name:
-                if current_group is not None:
-                    grouped_data.append(current_group)
-                
-                current_crclm_name = row.crclm_name
-                # Mapping crclm_id to academic_batch_id so your existing React type definition works
-                current_group = {
-                    "academic_batch_id": row.crclm_id, 
-                    "curriculum_name": row.crclm_name,
-                    "terms": []
-                }
+        # --- Grouping Logic to create nested JSON ---
+        final_list = []
+        # Group by curriculum ID (crclm_id)
+        for key, group in groupby(query_results, key=itemgetter(0)):
+            group_list = list(group)
+            first_item = group_list[0]
             
-            # Append term to the current optgroup/curriculum
-            current_group["terms"].append({
-                "term_id": row.crclm_term_id,
-                "term_name": row.term_name
-            })
-
-        # Append the final group
-        if current_group is not None:
-            grouped_data.append(current_group)
-
-        return returnSuccess(grouped_data)
+            curriculum_group = {
+                "crclm_id": first_item.academic_batch_id,
+                "crclm_name": first_item.academic_batch_code,
+                "terms": [
+                    {
+                        "crclm_id": row.academic_batch_id,
+                        "crclm_name": row.academic_batch_code,
+                        "crclm_term_id": row.semester_id,
+                        "term_name": row.semester_code,
+                    }
+                    for row in group_list
+                ]
+            }
+            final_list.append(curriculum_group)
+            
+        return returnSuccess(final_list)
 
     except Exception as e:
         return returnException(str(e))
