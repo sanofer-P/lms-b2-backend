@@ -2,6 +2,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Form, UploadFile, File, Query 
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.core.database import get_db
 from app.utils.auth_helper import get_current_user
@@ -15,6 +16,7 @@ from app.db.models import (
     IEMSemester,
     LMSMentorsGroup,
     LMSMentorsGroupTerms,
+    LMSGroupMentors,
     LMSGroupMentees,
     LMSMentoringSchedule,
     LMSMentoringSubGroup,
@@ -115,6 +117,23 @@ def save_uploaded_file(file):
 router = APIRouter()
 
 
+def _as_text(value):
+    """Make DATE/TIME/Decimal values safe for JSON responses."""
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _student_value(student, *names):
+    for name in names:
+        value = getattr(student, name, None)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 # ==========================================================
 # GET CURRICULUM LIST
 # ==========================================================
@@ -155,15 +174,26 @@ def get_academic_batch_list(
 @router.get("/get_semesters_by_academic_batch/{academic_batch_id}")
 def get_semesters_by_academic_batch(
     academic_batch_id: int,
+    mentors_group_id: int = Query(None),
     db: Session = Depends(get_db)
 ):
     try:
-
-        semesters = db.query(
-            IEMSemester
-        ).filter(
+        semesters_query = db.query(IEMSemester).filter(
             IEMSemester.academic_batch_id == academic_batch_id
-        ).order_by(
+        )
+
+        if mentors_group_id is not None:
+            mapped_semester_ids = db.query(
+                LMSMentorsGroupTerms.semester_id
+            ).filter(
+                LMSMentorsGroupTerms.mentors_group_id == mentors_group_id,
+                LMSMentorsGroupTerms.academic_batch_id == academic_batch_id
+            )
+            semesters_query = semesters_query.filter(
+                IEMSemester.semester_id.in_(mapped_semester_ids)
+            )
+
+        semesters = semesters_query.order_by(
             IEMSemester.semester
         ).all()
 
@@ -1285,6 +1315,240 @@ def get_individual_comments(
 # ==========================================================
 # CHANGE STATUS ROUTE
 # ==========================================================
+@router.get("/get_mmp_report")
+def get_mmp_report(
+    academic_batch_id: int,
+    mentors_group_id: int,
+    semester_id: int,
+    student_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Return the complete MMP report in one request.
+
+    This is the FastAPI equivalent of CodeIgniter's get_student_details(): the
+    selected curriculum, group, term and student are validated together before
+    any report data is returned.
+    """
+    try:
+        group = db.query(LMSMentorsGroup).filter(
+            LMSMentorsGroup.mentors_group_id == mentors_group_id,
+            LMSMentorsGroup.academic_batch_id == academic_batch_id
+        ).first()
+        if not group:
+            return returnException("Mentoring group not found for the selected curriculum.")
+
+        group_term = db.query(LMSMentorsGroupTerms).filter(
+            LMSMentorsGroupTerms.mentors_group_id == mentors_group_id,
+            LMSMentorsGroupTerms.semester_id == semester_id
+        ).first()
+        if not group_term:
+            return returnException("Term is not mapped to the selected mentoring group.")
+
+        mentee_mapping = db.query(LMSGroupMentees).filter(
+            LMSGroupMentees.mentors_group_terms_id == group_term.mentors_group_terms_id,
+            LMSGroupMentees.student_id == student_id
+        ).first()
+        if not mentee_mapping:
+            return returnException("Student is not mapped to the selected group and term.")
+
+        student = db.query(IEMStudents).filter(
+            IEMStudents.student_id == student_id
+        ).first()
+        if not student:
+            return returnException("Student not found.")
+
+        mentor_rows = db.query(LMSGroupMentors, IEMSUsers).join(
+            IEMSUsers,
+            IEMSUsers.id == LMSGroupMentors.mentor_id
+        ).filter(
+            LMSGroupMentors.mentors_group_terms_id == group_term.mentors_group_terms_id
+        ).all()
+        mentors = [
+            {
+                "mentor_id": mentor.mentor_id,
+                "mentor_name": " ".join(filter(None, [
+                    getattr(user, "title", None),
+                    getattr(user, "first_name", None),
+                    getattr(user, "last_name", None)
+                ])) or getattr(user, "username", "")
+            }
+            for mentor, user in mentor_rows
+        ]
+
+        schedules = db.query(LMSMentoringSchedule).filter(
+            LMSMentoringSchedule.mentors_group_terms_id == group_term.mentors_group_terms_id
+        ).order_by(LMSMentoringSchedule.schedule_id).all()
+
+        sessions = []
+        questionnaire_responses = []
+        suggestions = []
+
+        for schedule in schedules:
+            schedule_mapping = db.query(LMSMapMenteeSchedule).filter(
+                LMSMapMenteeSchedule.schedule_id == schedule.schedule_id,
+                LMSMapMenteeSchedule.student_id == student_id
+            ).first()
+            if not schedule_mapping:
+                continue
+
+            subgroup = db.query(LMSMentoringSubGroup).filter(
+                LMSMentoringSubGroup.sub_group_id == schedule_mapping.sub_group_id
+            ).first()
+            date_rows = []
+            if subgroup:
+                dates = db.query(LMSMentoringSubGrpDate).filter(
+                    LMSMentoringSubGrpDate.sub_group_id == subgroup.sub_group_id
+                ).order_by(LMSMentoringSubGrpDate.start_date).all()
+                date_rows = [{
+                    "start_date": _as_text(row.start_date),
+                    "end_date": _as_text(row.end_date),
+                    "start_time": _as_text(row.start_time),
+                    "end_time": _as_text(row.end_time),
+                    "status": row.status
+                } for row in dates]
+
+            response = db.query(LMSMenteeQuestionnaireResponse).filter(
+                LMSMenteeQuestionnaireResponse.student_id == student_id,
+                LMSMenteeQuestionnaireResponse.schedule_id == schedule.schedule_id
+            ).first()
+            response_data = None
+            if response:
+                answers = []
+                response_questions = db.query(LMSMenteeQuestionnaireResponseQue).filter(
+                    LMSMenteeQuestionnaireResponseQue.questionnaire_response_id ==
+                    response.questionnaire_response_id
+                ).all()
+                for response_question in response_questions:
+                    question = db.query(LMSQuestionnairesQuestions).filter(
+                        LMSQuestionnairesQuestions.questionnaire_que_id ==
+                        response_question.questionnaire_que_id
+                    ).first()
+                    option_rows = db.query(
+                        LMSMenteeQuestionnaireResponseOption,
+                        LMSQuestionnairesOptions
+                    ).join(
+                        LMSQuestionnairesOptions,
+                        LMSQuestionnairesOptions.questionnaire_options_id ==
+                        LMSMenteeQuestionnaireResponseOption.questionnaire_options_id
+                    ).filter(
+                        LMSMenteeQuestionnaireResponseOption.questionnaire_response_que_id ==
+                        response_question.questionnaire_response_que_id
+                    ).all()
+                    selected_options = [{
+                        "questionnaire_options_id": option.questionnaire_options_id,
+                        "option_text": getattr(option_detail, "que_option", None),
+                        "specification": (
+                            getattr(option, "specification", None)
+                            or getattr(option_detail, "specification", None)
+                            or ""
+                        )
+                    } for option, option_detail in option_rows]
+                    answer = {
+                        "questionnaire_que_id": response_question.questionnaire_que_id,
+                        "question_text": question.question if question else "",
+                        "text_answer": response_question.text_answer,
+                        "selected_options": selected_options
+                    }
+                    answers.append(answer)
+                    questionnaire_responses.append({
+                        **answer,
+                        "schedule_id": schedule.schedule_id,
+                        "submitted_at": _as_text(response.created_date)
+                    })
+                response_data = {
+                    "submitted_at": _as_text(response.created_date),
+                    "answers": answers
+                }
+
+            suggestion = db.query(LMSMMPSessionSuggestion).filter(
+                LMSMMPSessionSuggestion.schedule_id == schedule.schedule_id
+            ).first()
+            comments = []
+            if suggestion:
+                generic = db.query(LMSMMPSessionSuggestionGenericComments).filter(
+                    LMSMMPSessionSuggestionGenericComments.session_suggestion_id ==
+                    suggestion.session_suggestion_id
+                ).all()
+                individual = db.query(LMSMMPSessionSuggestionIndividualComments).filter(
+                    LMSMMPSessionSuggestionIndividualComments.session_suggestion_id ==
+                    suggestion.session_suggestion_id,
+                    LMSMMPSessionSuggestionIndividualComments.mentee_id == student_id
+                ).all()
+                for scope, rows in (("common", generic), ("individual", individual)):
+                    for row in rows:
+                        sender = db.query(IEMSUsers).filter(
+                            IEMSUsers.id == row.created_by
+                        ).first()
+                        item = {
+                            "scope": scope,
+                            "sender_name": " ".join(filter(None, [
+                                getattr(sender, "first_name", None),
+                                getattr(sender, "last_name", None)
+                            ])) if sender else "Student",
+                            "comment": row.comment,
+                            "attachment": row.attachment,
+                            "created_date": _as_text(row.created_date)
+                        }
+                        comments.append(item)
+                        suggestions.append({**item, "schedule_id": schedule.schedule_id})
+                comments.sort(key=lambda row: row.get("created_date") or "")
+
+            sessions.append({
+                "schedule_id": schedule.schedule_id,
+                "curriculum_id": academic_batch_id,
+                "mentors_group_id": mentors_group_id,
+                "group_name": group.mentors_pgm_title,
+                "semester_id": semester_id,
+                "questionnaire_id": schedule.questionnaire_id,
+                "session_agenda": schedule.session_agenda,
+                "sub_groups": [{
+                    "sub_group_name": subgroup.sub_group_name,
+                    "location": subgroup.location,
+                    "dates": date_rows
+                }] if subgroup else [],
+                "response": response_data,
+                "comments": comments
+            })
+
+        batch = db.query(IEMSAcademicBatch).filter(
+            IEMSAcademicBatch.academic_batch_id == academic_batch_id
+        ).first()
+        semester = db.query(IEMSemester).filter(
+            IEMSemester.semester_id == semester_id
+        ).first()
+
+        return returnSuccess({
+            "student": {
+                "student_id": student.student_id,
+                "student_usn": _student_value(student, "usno", "regno"),
+                "student_name": _student_value(student, "name"),
+                "student_email": _student_value(student, "email"),
+                "mobile": _student_value(student, "mobile")
+            },
+            "curriculum": {
+                "academic_batch_id": academic_batch_id,
+                "academic_batch_code": getattr(batch, "academic_batch_code", None),
+                "academic_batch_desc": getattr(batch, "academic_batch_desc", None)
+            },
+            "group": {
+                "mentors_group_id": mentors_group_id,
+                "mentors_pgm_title": group.mentors_pgm_title
+            },
+            "term": {
+                "semester_id": semester_id,
+                "semester_desc": getattr(semester, "semester_desc", None),
+                "term_name": getattr(semester, "term_name", None)
+            },
+            "mentors": mentors,
+            "sessions": sessions,
+            "questionnaire_responses": questionnaire_responses,
+            "suggestions": suggestions
+        })
+    except Exception as e:
+        return returnException(str(e))
+
+
 @router.post("/change_status")
 def change_status(
     sgd: int = Form(...),                  # Matches post parameter $this->input->post('sgd')

@@ -30,6 +30,12 @@ class QuestionnaireSave(BaseModel):
     access_level: int = 0
     parent_id: Optional[int] = None
 
+    # Mentoring sessions keep their own questionnaire copy when the template
+    # permits modification.  This ID links a newly-created copy back to the
+    # schedule that opened the editor.
+    schedule_id: Optional[int] = None
+    replace_questions: bool = False
+
     questions: List[QuestionCreate]
 
 class OptionResponse(BaseModel):

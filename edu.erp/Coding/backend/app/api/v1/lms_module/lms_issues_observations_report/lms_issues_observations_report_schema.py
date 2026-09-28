@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel
 
@@ -92,3 +92,7 @@ class MenteeStatusUpdate(BaseModel):
 class ParentStatusUpdate(BaseModel):
 
     parent_guardian_status: int
+
+
+class ExportIssueObservationRequest(BaseModel):
+    report_ids: List[int]

@@ -1,8 +1,10 @@
-from datetime import date,time
-from pydantic import BaseModel
-from typing import Optional,List
+from datetime import date, time
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional, List
 
 class SessionDateCreate(BaseModel):
+
+    sub_group_date_id: Optional[int] = None
 
     start_date: date
     end_date: date
@@ -11,6 +13,8 @@ class SessionDateCreate(BaseModel):
     end_time: time
 
 class SubGroupCreate(BaseModel):
+
+    sub_group_id: Optional[int] = None
 
     sub_group_name: str
 
@@ -30,7 +34,28 @@ class MentoringSessionCreate(BaseModel):
 
     session_agenda: str
 
-    sub_groups: List[SubGroupCreate]
+    sub_groups: List[SubGroupCreate] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_session(self):
+        seen_mentees = set()
+        for subgroup in self.sub_groups:
+            if not subgroup.dates:
+                raise ValueError(f"{subgroup.sub_group_name} must contain at least one date slot")
+            if not subgroup.mentee_ids:
+                raise ValueError(f"{subgroup.sub_group_name} must contain at least one mentee")
+            duplicate_ids = seen_mentees.intersection(subgroup.mentee_ids)
+            if duplicate_ids:
+                raise ValueError(
+                    f"Mentees cannot be assigned to more than one sub-group: {sorted(duplicate_ids)}"
+                )
+            seen_mentees.update(subgroup.mentee_ids)
+        return self
+
+
+class SessionStatusUpdate(BaseModel):
+    sub_group_date_id: int
+    status: int = Field(ge=0, le=4)
 
 class GroupCommentCreate(BaseModel):
     schedule_id: int

@@ -14,7 +14,8 @@ from app.db.models import (
     LMSQuestionnaires,
     LMSQuestionnairesQuestions,
     LMSQuestionnairesOptions,
-    LMSQuestionnaireFieldSetting
+    LMSQuestionnaireFieldSetting,
+    LMSMentoringSchedule
 )
 
 from .lms_mmp_questionnaire_schema import (
@@ -94,6 +95,23 @@ def save_questionnaire(
 
             questionnaire.modified_by = user_id
             questionnaire.modified_date = datetime.now()
+
+        if questionnaire_data.replace_questions and questionnaire_data.questionnaire_id is not None:
+            incoming_question_ids = {
+                item.questionnaire_que_id
+                for item in questionnaire_data.questions
+                if item.questionnaire_que_id is not None
+            }
+            existing_questions = db.query(LMSQuestionnairesQuestions).filter(
+                LMSQuestionnairesQuestions.questionnaire_id == questionnaire.questionnaire_id
+            ).all()
+            for existing_question in existing_questions:
+                if existing_question.questionnaire_que_id not in incoming_question_ids:
+                    db.query(LMSQuestionnairesOptions).filter(
+                        LMSQuestionnairesOptions.questionnaire_que_id ==
+                        existing_question.questionnaire_que_id
+                    ).delete(synchronize_session=False)
+                    db.delete(existing_question)
 
 
         # =====================================================
@@ -220,6 +238,8 @@ def save_questionnaire(
                     )
 
                     db.add(option)
+                    db.flush()
+                    incoming_option_ids.add(option.questionnaire_options_id)
 
 
                 # -------------------------------------------------
@@ -271,16 +291,7 @@ def save_questionnaire(
 
             for existing_option in existing_options:
 
-                if (
-                    existing_option.questionnaire_options_id
-                    not in incoming_option_ids
-                    and existing_option.questionnaire_options_id
-                    not in [
-                        option.questionnaire_options_id
-                        for option in question_item.options
-                        if option.questionnaire_options_id is None
-                    ]
-                ):
+                if existing_option.questionnaire_options_id not in incoming_option_ids:
 
                     db.delete(existing_option)
 
@@ -296,6 +307,17 @@ def save_questionnaire(
 
         print("NUMBER OF QUESTIONS:",
             len(questionnaire_data.questions))
+
+        if questionnaire_data.schedule_id is not None:
+            schedule = db.query(LMSMentoringSchedule).filter(
+                LMSMentoringSchedule.schedule_id == questionnaire_data.schedule_id
+            ).first()
+            if not schedule:
+                db.rollback()
+                return returnException("Mentoring schedule not found")
+            schedule.questionnaire_id = questionnaire.questionnaire_id
+            schedule.modified_by = user_id
+            schedule.modified_date = datetime.now()
 
         db.commit()
 

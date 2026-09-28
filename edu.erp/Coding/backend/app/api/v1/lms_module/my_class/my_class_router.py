@@ -31,47 +31,58 @@ def get_student_dropdowns(
     # -------------------------
     # TERMS (SEMESTERS)
     # -------------------------
-    term_query = "SELECT semester_id, semester_desc AS semester_name FROM iems_semester"
+    terms = []
     if academic_batch_id:
-        # If we want to filter semesters by academic batch, we might join with a mapping table.
-        # For now, keeping it simple as per existing patterns unless a specific mapping exists.
-        pass
-    terms = db.execute(text(term_query)).fetchall()
+        term_query = """
+            SELECT DISTINCT
+                sem.semester_id,
+                sem.semester_desc AS semester_name
+            FROM iems_semester sem
+            WHERE sem.academic_batch_id = :academic_batch_id
+            ORDER BY sem.semester_id
+        """
+        terms = db.execute(
+            text(term_query),
+            {"academic_batch_id": academic_batch_id}
+        ).fetchall()
 
     # -------------------------
     # COURSES + SECTIONS
     # -------------------------
-    # Filter courses and sections based on student and selected filters
-    cs_query = """
-        SELECT DISTINCT
-        c.crs_id AS course_id,
-        c.crs_code AS course_code,
-        c.crs_title AS course_title,
-        s.id AS section_id,
-        s.section AS section_name
-    FROM lms_lesson_schedule ls
+    course_section = []
+    if academic_batch_id and semester_id:
+        cs_query = """
+            SELECT DISTINCT
+                c.crs_id AS course_id,
+                c.crs_code AS course_code,
+                c.crs_title AS course_title,
+                sec.id AS section_id,
+                sec.section AS section_name
+            FROM iems_courses c
+            JOIN cudos_map_courseto_student mcs
+              ON mcs.crs_id = c.crs_id
+             AND mcs.academic_batch_id = c.academic_batch_id
+             AND mcs.semester_id = mcs.semester_id
+            JOIN iems_students stu
+              ON stu.student_id = mcs.student_id
+            JOIN iems_section sec
+              ON sec.id = mcs.section_id
+            WHERE c.academic_batch_id = :academic_batch_id
+              AND mcs.semester_id = :semester_id
+              AND mcs.student_id = :student_id
+        """
+        params = {
+            "academic_batch_id": academic_batch_id,
+            "semester_id": semester_id,
+            "student_id": student_id,
+        }
 
-    JOIN iems_courses c 
-        ON c.crs_id = ls.crs_id
+        if course_id:
+            cs_query += " AND c.crs_id = :course_id"
+            params["course_id"] = course_id
 
-    JOIN iems_section s 
-        ON s.id = ls.section_id
-
-    WHERE 1=1
-    """
-    params = {"student_id": student_id}
-    
-    if academic_batch_id:
-        cs_query += " AND c.academic_batch_id = :batch_id"
-        params["batch_id"] = academic_batch_id
-    if semester_id:
-        cs_query += " AND ls.semester_id = :semester_id"
-        params["semester_id"] = semester_id
-    if course_id:
-        cs_query += " AND c.crs_id = :course_id"
-        params["course_id"] = course_id
-
-    course_section = db.execute(text(cs_query), params).fetchall()
+        cs_query += " ORDER BY c.crs_code, c.crs_title"
+        course_section = db.execute(text(cs_query), params).fetchall()
 
     # Split courses & sections
     courses = []
@@ -108,77 +119,111 @@ def get_student_dropdowns(
         "sections": sections
     }
 
-@router.get("/class-list", response_model=ClassListResponse)
+@router.get("/class-list")
 def get_class_list(
     student_id: int,
+    academic_batch_id: int,
+    section_id: int,
+    semester_id: int,
+    selected_date: date,
     course_id: Optional[int] = None,
-    section_id: Optional[int] = None,
-    semester_id: Optional[int] = None,
-    selected_date: Optional[date] = None,
     db: Session = Depends(get_db)
 ):
-    query = """
-        SELECT 
-            ls.lesson_schedule_id,
-            ls.crs_id AS course_id,
-            c.crs_title AS course_title,
-            ls.section_id,
-            s.section AS section_name,
-            ls.plan_date AS class_date,
-            ls.start_time,
-            ls.end_time,
-            ls.video_link,
-            t.topic_id,
-            t.topic_title,
-            (SELECT portion_ref FROM lms_map_portion_ls ml WHERE ml.lesson_schedule_id = ls.lesson_schedule_id LIMIT 1) as portion_to_be_covered,
-            CASE
-    WHEN DATE(ls.plan_date) > CURDATE() THEN 'Scheduled'
-    
-    WHEN DATE(ls.plan_date) = CURDATE()
-         AND TIME(NOW()) BETWEEN ls.start_time AND ls.end_time THEN 'Active'
-    
-    WHEN DATE(ls.plan_date) < CURDATE() 
-         OR (DATE(ls.plan_date) = CURDATE() AND TIME(NOW()) > ls.end_time)
-         THEN 'Completed'
-    
-    ELSE 'Scheduled'
-END AS status
-        FROM lms_lesson_schedule ls
-        JOIN iems_courses c ON c.crs_id = ls.crs_id
-        JOIN iems_section s ON s.id = ls.section_id
-        LEFT JOIN topic_lesson_schedule tls ON tls.lesson_schedule_id = ls.lesson_schedule_id
-        LEFT JOIN cudos_topic t ON t.topic_id = tls.topic_id
-        JOIN cudos_map_courseto_student cs ON cs.crs_id = ls.crs_id AND cs.section_id = ls.section_id
-        WHERE cs.student_id = :student_id
-    """
-    params = {"student_id": student_id}
-    
-    if course_id:
-        query += " AND ls.crs_id = :course_id"
-        params["course_id"] = course_id
-    if section_id:
-        query += " AND ls.section_id = :section_id"
-        params["section_id"] = section_id
-    if semester_id:
-        query += " AND ls.semester_id = :semester_id"
-        params["semester_id"] = semester_id
-    if selected_date:
-        query += " AND DATE(ls.plan_date) = :selected_date"
-        params["selected_date"] = selected_date
+    student = db.execute(
+        text("""
+            SELECT usno AS student_usn
+            FROM iems_students
+            WHERE student_id = :student_id
+            LIMIT 1
+        """),
+        {"student_id": student_id}
+    ).mappings().first()
 
+    if not student or not student["student_usn"]:
+        return {"classes": []}
+
+    # CodeIgniter sets api_id to 1 when class_date is supplied.
+    api_id = 1
+
+    query = """
+        SELECT
+            lls.lls_id,
+            lls.lesson_schedule_id,
+            lls.crs_id AS course_id,
+            c.crs_code AS course_code,
+            c.crs_title AS course_title,
+            lls.section_id,
+            sec.section AS section_name,
+            DATE(lls.actual_start_date) AS class_date,
+            lls.start_time,
+            lls.end_time,
+            CAST(lms_fetch_timetable_topic_ids_map(lls.lls_id, :api_id) AS CHAR) AS topic_id,
+            lms_fetch_timetable_topic_mapping_data(lls.lls_id, :api_id) AS topic_title,
+            lms_fetch_tt_topic_portion_mapping_data(lls.lls_id, :api_id) AS portion_to_be_covered,
+            CAST(lms_fetch_lls_bloom_ids(lls.lls_id) AS CHAR) AS bloom_ids,
+            CAST(lms_fetch_lls_dlvry_mthd_ids(lls.lls_id) AS CHAR) AS delivery_method_ids,
+            lms_fetch_ls_bloom_mapping(lls.lls_id) AS bloom_level,
+            lms_fetch_ls_delivery_method_mapping(lls.lls_id) AS delivery_method,
+            (
+                SELECT ls.video_link
+                FROM lms_lesson_schedule ls
+                LEFT JOIN lms_ls_student_map lst ON lst.lls_id = ls.lls_id
+                WHERE ls.lls_id = lls.lls_id
+                    AND lst.student_usn = :student_usn
+                LIMIT 1
+            ) AS video_link,
+            CASE lls.status
+                WHEN 0 THEN 'Yet to start'
+                WHEN 1 THEN 'In progress'
+                WHEN 2 THEN 'Completed'
+                ELSE 'Yet to start'
+            END AS status
+        FROM lms_lesson_schedule lls
+        LEFT JOIN lms_ls_student_map st ON st.lls_id = lls.lls_id
+        LEFT JOIN cudos_topic top ON top.topic_id = lls.topic_id
+        LEFT JOIN topic_lesson_schedule tls
+            ON tls.lesson_schedule_id = lls.lesson_schedule_id
+        LEFT JOIN iems_courses c ON c.crs_id = lls.crs_id
+        LEFT JOIN iems_section sec ON sec.id = lls.section_id
+        WHERE lls.academic_batch_id = :academic_batch_id
+            AND lls.semester_id = :semester_id
+            AND lls.section_id = :section_id
+            AND st.student_usn = :student_usn
+            AND CAST(lls.actual_start_date AS CHAR) LIKE CONCAT('%', :selected_date, '%')
+    """
+    params = {
+        "academic_batch_id": academic_batch_id,
+        "semester_id": semester_id,
+        "section_id": section_id,
+        "student_usn": student["student_usn"],
+        "selected_date": selected_date.isoformat(),
+        "api_id": api_id,
+    }
+
+    if course_id:
+        query += " AND lls.crs_id = :course_id"
+        params["course_id"] = course_id
+
+    query += " GROUP BY lls.lls_id ORDER BY lls.start_time, lls.end_time"
     result = db.execute(text(query), params).fetchall()
 
     return {
         "classes": [
             {
+                "lls_id": r.lls_id,
                 "lesson_schedule_id": r.lesson_schedule_id,
                 "topic_id": r.topic_id,
                 "course_id": r.course_id,
+                "course_code": r.course_code,
                 "course_name": r.course_title,
                 "section_id": r.section_id,
                 "section_name": r.section_name,
                 "topic_title": r.topic_title,
                 "portion_to_be_covered": r.portion_to_be_covered,
+                "bloom_ids": r.bloom_ids,
+                "delivery_method_ids": r.delivery_method_ids,
+                "bloom_level": r.bloom_level,
+                "delivery_method": r.delivery_method,
                 "status": r.status,
                 "class_date": r.class_date,
                 "start_time": r.start_time,

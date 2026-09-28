@@ -49,8 +49,9 @@ class ClassListItem(BaseModel):
     portion_to_be_covered: Optional[str] = None
     status: Optional[str] = "Planned"
     class_date: date
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
+    # The legacy LMS query returns formatted values such as "08:30 AM".
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
     video_link: Optional[str] = None
 
 

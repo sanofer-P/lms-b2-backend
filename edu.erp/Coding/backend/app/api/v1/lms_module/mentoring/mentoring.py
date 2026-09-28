@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Optional, List
@@ -407,6 +407,7 @@ def list_curriculum(
 @router.get("/sessions/{schedule_id}/mentees")
 def get_session_mentees_list(
     schedule_id: int,
+    sub_group_id: int = Query(...),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
@@ -415,7 +416,10 @@ def get_session_mentees_list(
         if not schedule:
             return returnException("Mentoring schedule not found.")
 
-        mappings = db.query(LMSMapMenteeSchedule).filter(LMSMapMenteeSchedule.schedule_id == schedule_id).all()
+        mappings = db.query(LMSMapMenteeSchedule).filter(
+            LMSMapMenteeSchedule.schedule_id == schedule_id,
+            LMSMapMenteeSchedule.sub_group_id == sub_group_id
+        ).all()
         student_ids = [m.student_id for m in mappings]
 
         if not student_ids:
