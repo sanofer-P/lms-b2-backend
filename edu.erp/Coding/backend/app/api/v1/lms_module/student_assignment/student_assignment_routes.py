@@ -1,11 +1,12 @@
 """Assignment reports scoped to the selected batch, semester, course and section."""
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
+import os
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -21,7 +22,6 @@ from .student_assignment_schema import (
 )
 
 router = APIRouter(tags=["Student Assignment"], dependencies=[Depends(get_current_user)])
-
 
 def _parse_database_date(value) -> date | None:
     """Convert MySQL/legacy CodeIgniter date values into a Python date."""
@@ -224,6 +224,76 @@ ALLOWED_STUDENT_ASSIGNMENT_EXTENSIONS = {
 MAX_STUDENT_ASSIGNMENT_SIZE = 5 * 1024 * 1024
 
 
+def _assignment_storage_root() -> Path:
+    """Return the application root that owns the legacy uploads directory."""
+    configured_root = os.getenv("LMS_UPLOAD_ROOT")
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+    return Path(__file__).resolve().parents[5]
+
+
+def _resolve_assignment_file(stored_value: str) -> Path | None:
+    """Resolve legacy relative upload paths independently of Uvicorn's cwd."""
+    normalized = stored_value.replace("\\", "/").lstrip("/")
+    stored_path = Path(stored_value.replace("\\", "/"))
+
+    candidates = []
+    if stored_path.is_absolute():
+        candidates.append(stored_path)
+    else:
+        backend_root = Path(__file__).resolve().parents[5]
+        candidates.extend((
+            _assignment_storage_root() / normalized,
+            Path.cwd() / normalized,
+            backend_root / normalized,
+            backend_root.parent / normalized,
+        ))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+@router.get("/download/{lms_assignment_id}")
+def download_assignment_document(
+    lms_assignment_id: int,
+    student_id: int = Query(..., gt=0),
+    db: Session = Depends(get_db),
+):
+    """Download a faculty attachment mapped to the requesting student."""
+    assignment = db.execute(text("""
+        SELECT a.file_name, a.file_path
+        FROM lms_manage_assignment a
+        JOIN lms_map_assignment_to_students m
+          ON m.lms_assignment_id = a.lms_assignment_id
+        WHERE a.lms_assignment_id = :lms_assignment_id
+          AND m.ssd_id = :student_id
+        LIMIT 1
+    """), {
+        "lms_assignment_id": lms_assignment_id,
+        "student_id": student_id,
+    }).mappings().first()
+
+    if assignment is None:
+        raise HTTPException(404, "Assignment document not found")
+
+    file_name = Path(assignment["file_name"] or "").name
+    stored_value = str(assignment["file_path"] or "").strip()
+    if not file_name or not stored_value:
+        raise HTTPException(404, "No document is attached to this assignment")
+
+    file_path = _resolve_assignment_file(stored_value)
+    if file_path is None:
+        raise HTTPException(404, "Assignment document is missing from storage")
+
+    return FileResponse(
+        path=file_path,
+        filename=file_name,
+        media_type="application/octet-stream",
+    )
+
+
 @router.post(
     "/student-upload/{map_assignment_student_id}",
     response_model=StudentAssignmentUploadResponse,
@@ -279,15 +349,17 @@ def upload_student_assignment(
         "uploads", "ionlms", "upload_assignment_material",
         str(now.year), now.strftime("%W"),
     )
-    relative_directory.mkdir(parents=True, exist_ok=True)
+    physical_directory = _assignment_storage_root() / relative_directory
+    physical_directory.mkdir(parents=True, exist_ok=True)
     stored_name = (
         f"{int(now.timestamp())}_{uuid4().hex[:8]}_"
         f"{assignment['usno']}_{original_name}"
     )
-    stored_path = relative_directory / stored_name
+    relative_file_path = relative_directory / stored_name
+    physical_file_path = physical_directory / stored_name
 
     try:
-        stored_path.write_bytes(contents)
+        physical_file_path.write_bytes(contents)
         db.execute(text("""
             UPDATE lms_map_assignment_to_students
             SET file_name = :file_name,
@@ -298,7 +370,7 @@ def upload_student_assignment(
               AND ssd_id = :student_id
         """), {
             "file_name": original_name,
-            "file_path": stored_path.as_posix(),
+            "file_path": relative_file_path.as_posix(),
             "seen_on": now,
             "map_assignment_student_id": map_assignment_student_id,
             "student_id": student_id,
@@ -306,7 +378,7 @@ def upload_student_assignment(
         db.commit()
     except Exception:
         db.rollback()
-        stored_path.unlink(missing_ok=True)
+        physical_file_path.unlink(missing_ok=True)
         raise HTTPException(500, "Unable to save the assignment document")
     finally:
         file.file.close()
@@ -315,7 +387,7 @@ def upload_student_assignment(
         "status": True,
         "message": "Assignment uploaded successfully",
         "file_name": original_name,
-        "file_path": stored_path.as_posix(),
+        "file_path": relative_file_path.as_posix(),
     }
 
 # Use the upload mapping, as in CodeIgniter: an assignment need not have been

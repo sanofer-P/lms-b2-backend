@@ -69,6 +69,8 @@ from app.api.v1.lms_module.lms_mentoring_session.lms_mentoring_session import ro
 
 from app.api.v1.lms_module.lms_issues_observations_report.lms_issues_observations_report import router as issues_observations_report_router
 
+from app.api.v1.lms_module.student_material.student_shared_material import router as student_shared_material_router
+
 from app.api.v1.lms_module.lms_stud_issues_observations_report.lms_stud_issues_observations_report import router as stud_issues_observations_report_router
 
 from app.api.v1.lms_module.lms_stud_mentoring_session.lms_stud_mentoring_session import router as stud_mentoring_session_router
@@ -99,6 +101,9 @@ from app.api.v1.lms_module.topic_management.topic_routes import router as topic_
 from app.api.v1.lms_module.student_assignment.student_assignment_routes import router as student_assignment_router
 from app.api.v1.lms_module.conso_absentees_report.cons_absentees_report_routes import router as cons_absentees_router
 from app.api.v1.lms_module.reports.consolidated_student_marks_routes import router as consolidated_student_marks_router
+from app.api.v1.lms_module.student_attendance.student_attendance_report import (
+    router as student_attendance_report_router,
+)
 
 from app.api.v1.lms_module.announcement import router as announcement_router
 from app.api.v1.lms_module.manage_assignment import router as manage_assignment_router
@@ -653,6 +658,11 @@ router.include_router(manage_quiz_router, prefix="/manage-quiz", tags=["Manage Q
 router.include_router(export_timetable_router, prefix="/export-timetable", tags=["Export Timetable"])
 router.include_router(schedule_class_router, prefix="/schedule-class", tags=["Schedule Class"])
 router.include_router(tt_calendar_router, prefix="/tt-calendar", tags=["Timetable Calendar"])
+router.include_router(
+    student_attendance_report_router,
+    prefix="/student_attendance_report",
+    tags=["Student Attendance Report"],
+)
 
 # Reports
 router.include_router(student_record_report_router, prefix="/reports", tags=["Reports"])
@@ -680,3 +690,5 @@ router.include_router(
     prefix="/lms_issues_observations_report",
     tags=["Issues and Observations Report"]
 )
+
+router.include_router(student_shared_material_router, prefix="/student_shared_material", tags=["Student Shared Material"])
