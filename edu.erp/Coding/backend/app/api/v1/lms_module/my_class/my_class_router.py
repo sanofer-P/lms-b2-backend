@@ -56,8 +56,8 @@ def get_student_dropdowns(
                 c.crs_id AS course_id,
                 c.crs_code AS course_code,
                 c.crs_title AS course_title,
-                sec.id AS section_id,
-                sec.section AS section_name
+                sec.mt_details_id AS section_id,
+                sec.mt_details_name AS section_name
             FROM iems_courses c
             JOIN cudos_map_courseto_student mcs
               ON mcs.crs_id = c.crs_id
@@ -65,8 +65,8 @@ def get_student_dropdowns(
              AND mcs.semester_id = mcs.semester_id
             JOIN iems_students stu
               ON stu.student_id = mcs.student_id
-            JOIN iems_section sec
-              ON sec.id = mcs.section_id
+            JOIN cudos_master_type_details sec
+              ON sec.mt_details_id = mcs.section_id
             WHERE c.academic_batch_id = :academic_batch_id
               AND mcs.semester_id = :semester_id
               AND mcs.student_id = :student_id
@@ -153,7 +153,7 @@ def get_class_list(
             c.crs_code AS course_code,
             c.crs_title AS course_title,
             lls.section_id,
-            sec.section AS section_name,
+            sec.mt_details_name AS section_name,
             DATE(lls.actual_start_date) AS class_date,
             lls.start_time,
             lls.end_time,
@@ -184,7 +184,7 @@ def get_class_list(
         LEFT JOIN topic_lesson_schedule tls
             ON tls.lesson_schedule_id = lls.lesson_schedule_id
         LEFT JOIN iems_courses c ON c.crs_id = lls.crs_id
-        LEFT JOIN iems_section sec ON sec.id = lls.section_id
+        LEFT JOIN cudos_master_type_details sec ON sec.mt_details_id = lls.section_id
         WHERE lls.academic_batch_id = :academic_batch_id
             AND lls.semester_id = :semester_id
             AND lls.section_id = :section_id
